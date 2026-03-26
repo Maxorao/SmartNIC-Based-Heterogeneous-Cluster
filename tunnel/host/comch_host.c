@@ -1,36 +1,25 @@
 /*
- * comch_host.c — DOCA Comch host-side (x86) endpoint
+ * comch_host.c — Version dispatcher for host-side DOCA Comch.
  *
- * Provides a kernel-bypass PCIe messaging channel between the host CPU
- * and the BlueField-3 SmartNIC ARM.  Uses DOCA Communications Channel
- * (Comch) from DOCA 2.7.0.
+ * Selects the concrete implementation at compile time via COMCH_HOST_DOCA_VER:
  *
- * Build: see tunnel/host/Makefile
+ *   COMCH_HOST_DOCA_VER >= 30  →  comch_host_doca31.c   (DOCA 3.x, current)
  *
- * Usage (library):
- *   comch_host_ctx_t ctx;
- *   comch_host_init(&ctx, "03:00.0");
- *   comch_host_send(&ctx, buf, len);
- *   comch_host_recv(&ctx, buf, &len);
- *   comch_host_destroy(&ctx);
+ * Usage: callers include comch_api.h and link against this object.
+ * They never include implementation files directly.
+ *
+ * To add a new DOCA version: create comch_host_docaXX.c and add a branch below.
  */
 
-#include "comch_host.h"
+#include "../comch_api.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <doca_comm_channel.h>
-#include <doca_dev.h>
-#include <doca_error.h>
-#include <doca_log.h>
-
-#include "../../common/protocol.h"
-#include "../../common/timing.h"
-
-DOCA_LOG_REGISTER(COMCH_HOST);
+#if COMCH_HOST_DOCA_VER >= 30
+#  include "comch_host_doca31.c"
+#elif COMCH_HOST_DOCA_VER >= 20
+#  error "DOCA 2.x host-side Comch not implemented. Set COMCH_HOST_DOCA_VER=31."
+#else
+#  error "DOCA 1.x host-side Comch not implemented. Set COMCH_HOST_DOCA_VER=31."
+#endif
 
 /* ------------------------------------------------------------------
  * Internal helpers
