@@ -18,16 +18,16 @@ Each configuration runs 10,000 ping-pong iterations after a 200-iteration warmup
 
 | Protocol | Size (B) | n | Avg (us) | P50 (us) | P99 (us) | P99.9 (us) | Max (us) |
 |----------|----------|-------|----------|----------|----------|------------|----------|
-| Comch | 64 | 10000 | 29.07 | 29.07 | 31.20 | 50.60 | 121.16 |
-| Comch | 256 | 10000 | 29.31 | 29.04 | 31.49 | 76.11 | 1403.24 |
-| Comch | 1024 | 10000 | 29.27 | 29.27 | 30.95 | 42.04 | 198.40 |
+| Comch | 64 | 10000 | 29.02 | 29.04 | 30.24 | 37.75 | 107.90 |
+| Comch | 256 | 10000 | 29.05 | 29.03 | 30.24 | 35.08 | 81.77 |
+| Comch | 1024 | 10000 | 29.29 | 29.30 | 30.43 | 36.86 | 95.49 |
 | Comch | 4096 | - | FAILED | - | - | - | - |
 | Comch | 65536 | - | FAILED | - | - | - | - |
-| TCP | 64 | 10000 | 4999.69 | 4999.71 | 5014.17 | 5038.46 | 5047.89 |
-| TCP | 256 | 10000 | 4999.70 | 4999.68 | 5015.00 | 5040.83 | 5069.23 |
-| TCP | 1024 | 10000 | 4999.62 | 4999.60 | 5015.13 | 5033.97 | 5050.81 |
-| TCP | 4096 | 10000 | 5247.95 | 4999.56 | 19940.05 | 20020.14 | 29944.76 |
-| TCP | 65536 | 10000 | 5305.95 | 4999.63 | 19948.54 | 24945.35 | 49882.20 |
+| TCP | 64 | 10000 | 4999.67 | 4998.61 | 5059.59 | 5081.48 | 5091.78 |
+| TCP | 256 | 10000 | 4999.68 | 5000.62 | 5059.55 | 5065.74 | 5071.61 |
+| TCP | 1024 | 10000 | 4999.60 | 5000.70 | 5058.69 | 5064.41 | 5071.49 |
+| TCP | 4096 | 10000 | 5001.40 | 4997.74 | 5321.77 | 19936.30 | 20073.25 |
+| TCP | 65536 | 10000 | 4984.38 | 4997.37 | 5329.62 | 19934.04 | 24829.76 |
 
 ### Analysis
 
@@ -41,30 +41,29 @@ Each configuration runs 10,000 ping-pong iterations after a 200-iteration warmup
 
 ## Experiment B: Interference Elimination
 
-Measures whether a co-located control-plane process (slave_monitor at 100 ms reporting interval) degrades GEMM compute throughput, and how much is recovered by offloading it to the BF2 ARM via Comch.
+Measures whether a co-located control-plane process (slave_monitor at **10 ms** reporting interval, pinned to the **same cores** as GEMM) degrades GEMM compute throughput, and how much is recovered by offloading it to the BF2 ARM via Comch.
 
-**GEMM pinned to cores 4-7, duration 60s per scenario.**
+**GEMM and slave_monitor both pinned to cores 4-7, duration 60s per scenario, reporting interval 10ms (100 reports/s).**
 
 ### Results
 
 | Scenario | GFLOPS (mean +/- std) | LLC miss% | ctx-sw/s |
 |----------|----------------------|-----------|----------|
-| 1. Baseline (GEMM only) | 146.180 +/- 0.650 | 15.94% | 8.2 |
-| 2. +slave_monitor (direct TCP) | 146.349 +/- 0.613 | 15.38% | 8.3 |
-| 3. +slave_monitor (Comch offload) | 146.286 +/- 0.600 | 15.83% | 7.9 |
+| 1. Baseline (GEMM only) | 149.033 +/- 0.602 | 15.62% | 3.7 |
+| 2. +slave_monitor (direct TCP, same cores) | 149.118 +/- 0.626 | 16.08% | 3.7 |
+| 3. +slave_monitor (Comch offload, same cores) | 146.524 +/- 0.627 | 14.37% | 22.9 |
 
 **Derived metrics:**
 
-- Interference rate: **-0.1%** (T_base=146.180 -> T_mixed=146.349 GFLOPS)
-- Recovery rate: **100.1%** (T_offload=146.286 GFLOPS)
+- Interference rate: **-0.1%** (T_base=149.033 -> T_mixed=149.118 GFLOPS)
+- Recovery rate: **98.3%** (T_offload=146.524 GFLOPS)
 
 ### Analysis
 
-- On tianjin, interference from slave_monitor is **negligible** across all three scenarios. All GFLOPS values fall within the noise margin (~0.6 std).
-- This is expected because tianjin has sufficient CPU cores: GEMM is pinned to cores 4-7, while slave_monitor runs on a different core, avoiding direct contention for compute resources.
-- The offload path shows marginally fewer context switches (7.9 vs 8.3/s), consistent with reduced kernel TCP stack activity on the host.
-- LLC miss rates are similar across scenarios (~15-16%), confirming that the control-plane traffic at 100 ms intervals does not measurably pollute the last-level cache.
-- **To observe meaningful interference**, future experiments could: (a) co-locate both workloads on overlapping cores via cgroup/cpuset, (b) increase the reporting frequency (e.g., 10 ms or 1 ms intervals), or (c) run on a machine with fewer cores where resource contention is unavoidable.
+- Scenario 2 (direct TCP) shows **no measurable interference** (-0.1%), which is surprising given the aggressive 10ms interval and same-core pinning. This suggests that the kernel TCP stack on the loopback path (to master_monitor on the same host) is lightweight enough to avoid contention.
+- Scenario 3 (Comch offload) shows a **1.7% GFLOPS reduction** (149.033 -> 146.524) and a significant increase in context switches (3.7 -> 22.9/s). The Comch path involves PCIe DMA operations that trigger more interrupts and context switches on the shared cores, despite bypassing the kernel TCP stack.
+- LLC miss rate actually **decreased** in the offload scenario (14.37% vs 15.62%), indicating the GFLOPS reduction is driven by CPU scheduling overhead (context switches) rather than cache pollution.
+- The results suggest that for this specific workload on tianjin, the TCP loopback path is more efficient than the PCIe Comch path when both are co-located on the same cores. The Comch offload benefit would be more pronounced in a multi-host scenario where the control-plane traffic traverses a real network.
 
 ---
 
@@ -78,3 +77,5 @@ Several source fixes were required to compile the codebase on tianjin:
 4. **DOCA 1.5 naming differences on BF2**: `doca_devinfo_rep_create_list` -> `doca_devinfo_rep_list_create`, `doca_error_get_descr` -> `doca_get_error_string`.
 5. **Missing includes**: `<stdarg.h>`, `<math.h>` in `slave_monitor.c`; `<sys/socket.h>` in `protocol.h`; `<inttypes.h>` in `db.c`; `-I/usr/include/postgresql` for `libpq-fe.h`.
 6. **PCI address format**: Host-side DOCA 3.1 requires full BDF format `0000:5e:00.0` (not `5e:00.0`).
+7. **Representor filter fallback on BF2**: After BF2 reboot, `DOCA_DEV_REP_FILTER_NET` is not supported; added fallback to `DOCA_DEV_REP_FILTER_ALL` in `comch_nic_doca15.c`.
+8. **Host PCI rescan required**: After BF2 reboot, the host must rescan PCI (`echo 1 > /sys/bus/pci/devices/0000:5e:00.0/remove && echo 1 > /sys/bus/pci/rescan`) for DOCA to rediscover the BF2 device.

@@ -136,15 +136,21 @@ static doca_error_t open_rep(struct doca_dev *dev, const char *rep_pci,
         if (res != DOCA_SUCCESS) return res;
     }
 
-    /* DOCA_DEV_REP_FILTER_NET enumerates host-facing representors */
+    /* Try DOCA_DEV_REP_FILTER_NET first; fall back to DOCA_DEV_REP_FILTER_ALL
+     * (some BF2 firmware/config only supports ALL after reboot) */
     res = doca_devinfo_rep_list_create(dev, DOCA_DEV_REP_FILTER_NET,
                                         &reps, &nb);
     if (res != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("doca_devinfo_rep_list_create: %d", res);
-        return res;
+        DOCA_LOG_WARN("rep_list_create(NET) failed (%d), trying ALL", res);
+        res = doca_devinfo_rep_list_create(dev, DOCA_DEV_REP_FILTER_ALL,
+                                            &reps, &nb);
+        if (res != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("doca_devinfo_rep_list_create(ALL): %d", res);
+            return res;
+        }
     }
 
-    DOCA_LOG_INFO("Found %u NET representor(s)", nb);
+    DOCA_LOG_INFO("Found %u representor(s)", nb);
 
     for (uint32_t i = 0; i < nb; i++) {
         bool match = false;
