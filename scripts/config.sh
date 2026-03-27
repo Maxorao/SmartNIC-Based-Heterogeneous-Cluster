@@ -37,7 +37,7 @@ NIC_FORWARD_ROUTINE="/root/experiments/control-plane/forwarder/forward_routine"
 # Experiment parameters
 # ---------------------------------------------------------------
 COMPUTE_CORES="4-7"          # CPU cores for gemm_bench (avoid core 0)
-HIGH_LOAD_INTERVAL=100       # ms — slave report interval under load
+HIGH_LOAD_INTERVAL=10        # ms — slave report interval under load (aggressive: 100 reports/s to stress compute cores)
 NORMAL_INTERVAL=1000         # ms — normal slave report interval
 BENCH_ITERS=10000            # ping-pong iterations per size
 GEMM_DURATION=60             # seconds per GEMM phase

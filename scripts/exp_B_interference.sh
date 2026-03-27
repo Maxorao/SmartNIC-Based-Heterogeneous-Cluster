@@ -70,7 +70,8 @@ run_scenario 1 "gemm_bench alone (baseline)"
 # ── Scenario 2: No offload — slave_monitor runs on host via TCP ──────────────
 echo "--- Scenario 2: gemm + slave_monitor (direct TCP, no offload) ---"
 
-"${SLAVE_MONITOR}" \
+# Pin slave_monitor to the same cores as GEMM to force CPU and cache competition
+taskset -c "${COMPUTE_CORES}" "${SLAVE_MONITOR}" \
     --mode=direct \
     --master-ip="${MASTER_IP}" \
     --master-port="${MASTER_PORT}" \
@@ -97,7 +98,10 @@ ssh root@${BF_IP} \
      > /tmp/forward_routine.log 2>&1 &"
 sleep 3
 
-sudo "${SLAVE_MONITOR}" \
+# Also pin to compute cores — fair comparison: offload path should cause less
+# interference even when competing on the same cores, because Comch sends are
+# PCIe DMA (no kernel TCP stack, no blocking syscalls)
+sudo taskset -c "${COMPUTE_CORES}" "${SLAVE_MONITOR}" \
     --mode=offload \
     --pci="${HOST_PCI}" \
     --interval="${HIGH_LOAD_INTERVAL}" \
