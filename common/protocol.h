@@ -4,8 +4,12 @@
 
 #pragma once
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #define PROTO_MAGIC       0xBEEF1234U
 #define PROTO_MAX_PAYLOAD 4096

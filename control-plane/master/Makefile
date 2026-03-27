@@ -1,4 +1,4 @@
-CFLAGS  = -Wall -Wextra -O2 -I../../common
+CFLAGS  = -Wall -Wextra -O2 -I../../common -I/usr/include/postgresql
 LDFLAGS = -lpq -lpthread
 
 CC ?= gcc

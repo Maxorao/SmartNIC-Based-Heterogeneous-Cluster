@@ -39,7 +39,7 @@
 
 #include "../../common/protocol.h"
 #include "../../common/timing.h"
-#include "../../tunnel/nic/comch_nic.h"
+#include "../../tunnel/comch_api.h"
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                        */
@@ -176,10 +176,10 @@ int main(int argc, char *argv[])
             g_pci_addr, g_master_ip, g_master_port);
 
     /* Initialise Comch NIC side */
-    comch_nic_ctx_t comch;
-    doca_error_t ret = comch_nic_init(&comch, g_pci_addr);
+    comch_nic_ctx_t *comch = NULL;
+    doca_error_t ret = comch_nic_init(&comch, g_pci_addr, "auto", COMCH_SERVICE_NAME);
     if (ret != DOCA_SUCCESS) {
-        fwd_log("FATAL: comch_nic_init failed: %s", doca_error_get_descr(ret));
+        fwd_log("FATAL: comch_nic_init failed: %s", doca_get_error_string(ret));
         return 1;
     }
 
@@ -207,11 +207,11 @@ int main(int argc, char *argv[])
     while (g_running) {
         /* ---- Receive from host via Comch ---- */
         size_t msg_len = sizeof(comch_buf);
-        doca_error_t cr = comch_nic_recv_blocking(&comch, comch_buf,
+        doca_error_t cr = comch_nic_recv_blocking(comch, comch_buf,
                                                    &msg_len, 2000);
         if (cr == DOCA_ERROR_TIME_OUT) continue;
         if (cr != DOCA_SUCCESS) {
-            fwd_log("comch_recv error: %s — continuing", doca_error_get_descr(cr));
+            fwd_log("comch_recv error: %s — continuing", doca_get_error_string(cr));
             g_stats.errors++;
             continue;
         }
@@ -278,9 +278,9 @@ int main(int argc, char *argv[])
                                                 (msg_type_t)ack_hdr.type,
                                                 ack_hdr.seq,
                                                 ack_payload, ack_hdr.payload_len);
-        cr = comch_nic_send(&comch, ack_buf, ack_total);
+        cr = comch_nic_send(comch, ack_buf, ack_total);
         if (cr != DOCA_SUCCESS && cr != DOCA_ERROR_AGAIN)
-            fwd_log("comch ACK send error: %s", doca_error_get_descr(cr));
+            fwd_log("comch ACK send error: %s", doca_get_error_string(cr));
         else
             g_stats.ack_count++;
 
@@ -290,7 +290,7 @@ int main(int argc, char *argv[])
 
 cleanup:
     if (tcp_fd >= 0) close(tcp_fd);
-    comch_nic_destroy(&comch);
+    comch_nic_destroy(comch);
     fwd_log("exiting");
     return 0;
 }

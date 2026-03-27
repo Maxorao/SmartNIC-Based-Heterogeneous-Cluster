@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <time.h>
 
 #include <doca_comm_channel.h>
@@ -136,10 +137,10 @@ static doca_error_t open_rep(struct doca_dev *dev, const char *rep_pci,
     }
 
     /* DOCA_DEV_REP_FILTER_NET enumerates host-facing representors */
-    res = doca_devinfo_rep_create_list(dev, DOCA_DEV_REP_FILTER_NET,
+    res = doca_devinfo_rep_list_create(dev, DOCA_DEV_REP_FILTER_NET,
                                         &reps, &nb);
     if (res != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("doca_devinfo_rep_create_list: %d", res);
+        DOCA_LOG_ERR("doca_devinfo_rep_list_create: %d", res);
         return res;
     }
 
@@ -167,7 +168,7 @@ static doca_error_t open_rep(struct doca_dev *dev, const char *rep_pci,
         }
     }
 
-    doca_devinfo_rep_destroy_list(reps);
+    doca_devinfo_rep_list_destroy(reps);
 
     if (!found) {
         DOCA_LOG_ERR("No suitable representor found%s%s",

@@ -31,7 +31,7 @@
 
 #include "../../common/protocol.h"
 #include "../../common/timing.h"
-#include "../../tunnel/host/comch_host.h"
+#include "../../tunnel/comch_api.h"
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                        */
@@ -279,13 +279,13 @@ int main(int argc, char *argv[])
     }
 
     /* Initialise transports */
-    comch_host_ctx_t comch_ctx;
+    comch_host_ctx_t *comch_ctx = NULL;
     int comch_ok = 0;
     if (g_mode == MODE_COMCH || g_mode == MODE_ALL) {
-        doca_error_t ret = comch_host_init(&comch_ctx, g_pci_addr);
+        doca_error_t ret = comch_host_init(&comch_ctx, g_pci_addr, COMCH_SERVICE_NAME);
         if (ret != DOCA_SUCCESS) {
             fprintf(stderr, "comch_host_init failed: %s\n",
-                    doca_error_get_descr(ret));
+                    doca_error_get_name(ret));
             if (g_mode == MODE_COMCH) return 1;
             fprintf(stderr, "Skipping comch tests.\n");
         } else {
@@ -298,7 +298,7 @@ int main(int argc, char *argv[])
         tcp_fd = tcp_connect_nic();
         if (tcp_fd < 0) {
             fprintf(stderr, "TCP connect to NIC failed\n");
-            if (g_mode == MODE_TCP) { if (comch_ok) comch_host_destroy(&comch_ctx); return 1; }
+            if (g_mode == MODE_TCP) { if (comch_ok) comch_host_destroy(comch_ctx); return 1; }
             fprintf(stderr, "Skipping TCP tests.\n");
         }
     }
@@ -311,7 +311,7 @@ int main(int argc, char *argv[])
     for (size_t s = 0; s < n_sizes; s++) {
         uint32_t sz = sizes_to_test[s];
         if (comch_ok)
-            run_one("comch", sz, &comch_ctx, -1);
+            run_one("comch", sz, comch_ctx, -1);
         if (tcp_fd >= 0)
             run_one("tcp", sz, NULL, tcp_fd);
     }
@@ -319,7 +319,7 @@ int main(int argc, char *argv[])
     printf("\n=== Final Summary ===\n");
 
     /* Cleanup */
-    if (comch_ok) comch_host_destroy(&comch_ctx);
+    if (comch_ok) comch_host_destroy(comch_ctx);
     if (tcp_fd >= 0) close(tcp_fd);
 
     return 0;

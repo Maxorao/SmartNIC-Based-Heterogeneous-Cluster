@@ -3,15 +3,17 @@ DOCA_DIR  ?= /opt/mellanox/doca
 HOST_CFLAGS  = -Wall -Wextra -O2 \
                -I$(DOCA_DIR)/include \
                -I../../common \
-               -I../../tunnel/host
+               -I../../tunnel \
+               -DCOMCH_HOST_DOCA_VER=31
 HOST_LDFLAGS = -L$(DOCA_DIR)/lib/x86_64-linux-gnu \
-               -ldoca_comm_channel -ldoca_common -ldoca_argp \
+               -ldoca_comch -ldoca_common -ldoca_argp \
                -Wl,-rpath,$(DOCA_DIR)/lib/x86_64-linux-gnu
 
 NIC_CFLAGS   = -Wall -Wextra -O2 \
                -I$(DOCA_DIR)/include \
                -I../../common \
-               -I../../tunnel/nic
+               -I../../tunnel \
+               -DCOMCH_NIC_DOCA_VER=15
 NIC_LDFLAGS  = -L$(DOCA_DIR)/lib/aarch64-linux-gnu \
                -ldoca_comm_channel -ldoca_common -ldoca_argp \
                -Wl,-rpath,$(DOCA_DIR)/lib/aarch64-linux-gnu \

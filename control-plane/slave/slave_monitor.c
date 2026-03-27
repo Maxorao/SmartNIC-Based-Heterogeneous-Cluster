@@ -34,13 +34,15 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <getopt.h>
+#include <stdarg.h>
+#include <math.h>
 
 #include "../../common/protocol.h"
 #include "../../common/timing.h"
 
 /* Only pull in DOCA headers when building offload mode */
 #ifndef NO_DOCA
-#include "../../tunnel/host/comch_host.h"
+#include "../../tunnel/comch_api.h"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -280,16 +282,16 @@ int main(int argc, char *argv[])
     /* ---- Transport initialisation ---- */
 
 #ifndef NO_DOCA
-    comch_host_ctx_t comch_ctx;
+    comch_host_ctx_t *comch_ctx = NULL;
 #endif
     int tcp_fd = -1;
 
     if (g_cfg.mode == MODE_OFFLOAD) {
 #ifndef NO_DOCA
-        doca_error_t ret = comch_host_init(&comch_ctx, g_cfg.pci_addr);
+        doca_error_t ret = comch_host_init(&comch_ctx, g_cfg.pci_addr, COMCH_SERVICE_NAME);
         if (ret != DOCA_SUCCESS) {
             log_msg("FATAL: comch_host_init failed: %s",
-                    doca_error_get_descr(ret));
+                    doca_error_get_name(ret));
             exit(1);
         }
         log_msg("offload path initialised (PCI %s)", g_cfg.pci_addr);
@@ -331,7 +333,7 @@ int main(int argc, char *argv[])
         }
     } else {
 #ifndef NO_DOCA
-        doca_error_t ret = comch_host_send(&comch_ctx, msg_buf, (size_t)total);
+        doca_error_t ret = comch_host_send(comch_ctx, msg_buf, (size_t)total);
         if (ret != DOCA_SUCCESS) {
             log_msg("REGISTER comch_send failed");
             goto cleanup;
@@ -406,9 +408,9 @@ int main(int argc, char *argv[])
             }
         } else {
 #ifndef NO_DOCA
-            doca_error_t ret = comch_host_send(&comch_ctx, msg_buf, (size_t)total);
+            doca_error_t ret = comch_host_send(comch_ctx, msg_buf, (size_t)total);
             if (ret != DOCA_SUCCESS && ret != DOCA_ERROR_AGAIN) {
-                log_msg("comch send error: %s", doca_error_get_descr(ret));
+                log_msg("comch send error: %s", doca_error_get_name(ret));
                 break;
             }
 #endif
@@ -426,14 +428,14 @@ int main(int argc, char *argv[])
         send(tcp_fd, msg_buf, (size_t)total, MSG_NOSIGNAL);
 #ifndef NO_DOCA
     else if (g_cfg.mode == MODE_OFFLOAD)
-        comch_host_send(&comch_ctx, msg_buf, (size_t)total);
+        comch_host_send(comch_ctx, msg_buf, (size_t)total);
 #endif
     log_msg("DEREGISTER sent");
 
 cleanup:
     if (tcp_fd >= 0) close(tcp_fd);
 #ifndef NO_DOCA
-    if (g_cfg.mode == MODE_OFFLOAD) comch_host_destroy(&comch_ctx);
+    if (g_cfg.mode == MODE_OFFLOAD) comch_host_destroy(comch_ctx);
 #endif
     log_msg("exiting");
     return 0;

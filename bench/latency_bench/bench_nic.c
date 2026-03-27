@@ -30,7 +30,7 @@
 
 #include "../../common/protocol.h"
 #include "../../common/timing.h"
-#include "../../tunnel/nic/comch_nic.h"
+#include "../../tunnel/comch_api.h"
 
 #define TCP_ECHO_PORT 12345
 
@@ -48,10 +48,10 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
 static void run_comch_echo(void)
 {
-    comch_nic_ctx_t ctx;
-    doca_error_t ret = comch_nic_init(&ctx, g_pci_addr);
+    comch_nic_ctx_t *ctx = NULL;
+    doca_error_t ret = comch_nic_init(&ctx, g_pci_addr, "auto", COMCH_SERVICE_NAME);
     if (ret != DOCA_SUCCESS) {
-        fprintf(stderr, "comch_nic_init: %s\n", doca_error_get_descr(ret));
+        fprintf(stderr, "comch_nic_init: %s\n", doca_get_error_string(ret));
         return;
     }
 
@@ -63,10 +63,10 @@ static void run_comch_echo(void)
 
     while (g_running) {
         size_t len = sizeof(buf);
-        ret = comch_nic_recv_blocking(&ctx, buf, &len, 1000);
+        ret = comch_nic_recv_blocking(ctx, buf, &len, 1000);
         if (ret == DOCA_ERROR_TIME_OUT) continue;
         if (ret != DOCA_SUCCESS) {
-            fprintf(stderr, "comch_recv error: %s\n", doca_error_get_descr(ret));
+            fprintf(stderr, "comch_recv error: %s\n", doca_get_error_string(ret));
             break;
         }
 
@@ -83,16 +83,16 @@ static void run_comch_echo(void)
                                  hdr->payload_len);
         if (total < 0) continue;
 
-        ret = comch_nic_send(&ctx, reply_buf, (size_t)total);
+        ret = comch_nic_send(ctx, reply_buf, (size_t)total);
         if (ret != DOCA_SUCCESS && ret != DOCA_ERROR_AGAIN)
-            fprintf(stderr, "comch_send error: %s\n", doca_error_get_descr(ret));
+            fprintf(stderr, "comch_send error: %s\n", doca_get_error_string(ret));
 
         count++;
         if (count % 1000 == 0)
             fprintf(stderr, "echoed %lu messages\n", (unsigned long)count);
     }
 
-    comch_nic_destroy(&ctx);
+    comch_nic_destroy(ctx);
     fprintf(stderr, "bench_nic (comch): done, echoed %lu messages\n",
             (unsigned long)count);
 }

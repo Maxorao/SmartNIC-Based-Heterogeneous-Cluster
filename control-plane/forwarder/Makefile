@@ -2,7 +2,8 @@ DOCA_DIR  ?= /opt/mellanox/doca
 CFLAGS    = -Wall -Wextra -O2 \
             -I$(DOCA_DIR)/include \
             -I../../common \
-            -I../../tunnel/nic
+            -I../../tunnel \
+            -DCOMCH_NIC_DOCA_VER=15
 LDFLAGS   = -L$(DOCA_DIR)/lib/aarch64-linux-gnu \
             -ldoca_comm_channel -ldoca_common -ldoca_argp \
             -Wl,-rpath,$(DOCA_DIR)/lib/aarch64-linux-gnu \

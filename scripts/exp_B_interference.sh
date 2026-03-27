@@ -1,23 +1,25 @@
 #!/bin/bash
 # Experiment B: Control Plane Interference Elimination Effect
+# Adapted for tianjin single-host + BF2 setup.
+#
 # Tests GEMM throughput in three scenarios:
-#   Scenario 1 (baseline):  gemm_bench alone
+#   Scenario 1 (baseline):   gemm_bench alone
 #   Scenario 2 (no offload): gemm_bench + slave_monitor in direct TCP mode (100ms interval)
-#   Scenario 3 (offload):   gemm_bench + slave_monitor in DOCA Comch offload mode (100ms interval)
+#   Scenario 3 (offload):    gemm_bench + slave_monitor in DOCA Comch offload mode (100ms interval)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-DURATION=60        # seconds per scenario
-WARMUP_SECS=5      # seconds to discard at start/end
+DURATION="${GEMM_DURATION:-60}"
+WARMUP_SECS=5
 
 echo "=== Experiment B: Interference Elimination ==="
 echo "Duration per scenario: ${DURATION}s | Compute cores: ${COMPUTE_CORES}"
 echo "Output dir: ${DATA_DIR}/B"
 echo ""
 
-# ── Helper: wait for a PID, kill it, wait for perf to flush ──────────────────
+# ── Helper: kill PIDs ─────────────────────────────────────────────────────────
 cleanup_pids() {
     for pid in "$@"; do
         kill "$pid" 2>/dev/null || true
@@ -40,7 +42,7 @@ run_scenario() {
 
     sleep 1   # let gemm start before attaching perf
 
-    # Monitor gemm_bench with perf stat, writing hardware counters every second
+    # Monitor gemm_bench with perf stat
     perf stat -p "${GEMM_PID}" \
         -e LLC-load-misses,LLC-loads,context-switches,instructions \
         -I 1000 \
@@ -54,6 +56,13 @@ run_scenario() {
     echo "  Done. GFLOPS data: ${DATA_DIR}/B/scenario${scenario_id}_gflops.txt"
     sleep 5   # let system stabilize before next scenario
 }
+
+# ── Start master_monitor in background (needed for scenarios 2 & 3) ──────────
+echo "[exp_B] Starting master_monitor on port ${MASTER_PORT}..."
+"${MASTER_MONITOR}" --port="${MASTER_PORT}" \
+    > "${DATA_DIR}/B/master.log" 2>&1 &
+MASTER_PID=$!
+sleep 2
 
 # ── Scenario 1: Baseline (gemm only) ─────────────────────────────────────────
 run_scenario 1 "gemm_bench alone (baseline)"
@@ -77,11 +86,20 @@ sleep 5
 
 # ── Scenario 3: Offload — slave_monitor routes via SmartNIC ──────────────────
 echo "--- Scenario 3: gemm + slave_monitor (DOCA Comch offload) ---"
-echo "  (Ensure forward_routine is running on ${GNODE2_BF_IP})"
 
-"${SLAVE_MONITOR}" \
+# Start forward_routine on BF2
+echo "  Starting forward_routine on BF2..."
+ssh root@${BF_IP} "pkill -f forward_routine 2>/dev/null || true" || true
+sleep 1
+ssh root@${BF_IP} \
+    "nohup ${NIC_FORWARD_ROUTINE} --pci=${NIC_PCI} \
+     --master-ip=${MASTER_IP} --master-port=${MASTER_PORT} \
+     > /tmp/forward_routine.log 2>&1 &"
+sleep 3
+
+sudo "${SLAVE_MONITOR}" \
     --mode=offload \
-    --pci="${GNODE2_PCI}" \
+    --pci="${HOST_PCI}" \
     --interval="${HIGH_LOAD_INTERVAL}" \
     --node-id="exp-node-$(hostname)" \
     > "${DATA_DIR}/B/scenario3_slave.log" 2>&1 &
@@ -91,14 +109,17 @@ sleep 2
 run_scenario 3 "gemm + slave_monitor offload (${HIGH_LOAD_INTERVAL}ms interval)"
 cleanup_pids "${SLAVE_PID}"
 
+# Cleanup forward_routine and master
+ssh root@${BF_IP} "pkill -f forward_routine 2>/dev/null || true" || true
+cleanup_pids "${MASTER_PID}"
+
 # ── Print quick summary ───────────────────────────────────────────────────────
 echo ""
 echo "=== Quick Summary ==="
 for s in 1 2 3; do
     f="${DATA_DIR}/B/scenario${s}_gflops.txt"
     if [ -f "$f" ]; then
-        # Skip warmup lines, compute mean
-        avg=$(awk "NR>${WARMUP_SECS} && NR<=NF-${WARMUP_SECS} {s+=\$1; n++} END{printf \"%.3f\", s/n}" "$f")
+        avg=$(awk "NR>${WARMUP_SECS} && NR<=(NR-${WARMUP_SECS}) {s+=\$1; n++} END{if(n>0) printf \"%.3f\", s/n; else print \"N/A\"}" "$f" 2>/dev/null || echo "N/A")
         echo "  Scenario ${s}: avg GFLOPS = ${avg}"
     fi
 done
