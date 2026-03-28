@@ -1,25 +1,59 @@
 #!/bin/bash
-# config.sh — tianjin single-host configuration
+# config.sh — Multi-host cluster configuration
+#
+# Topology:
+#   tianjin (172.28.4.75) — master node
+#   fujian  (172.28.4.77) — worker node
+#   helong  (172.28.4.85) — worker node
+#
+# BF2 SmartNIC fabric (100G switch):
+#   tianjin BF2 p1: 192.168.56.2
+#   fujian  BF2 p1: 192.168.56.3
+#   helong  BF2 p0: 192.168.56.1
+#
+# Each host reaches its own BF2 via tmfifo (192.168.100.1 ↔ .2)
 
-# This node acts as both master and the single worker for these experiments
-MASTER_IP="172.28.4.75"
-MASTER_PORT="9000"
+# ---------------------------------------------------------------
+# Host IPs (management LAN — eno1)
+# ---------------------------------------------------------------
+TIANJIN_IP="172.28.4.75"
+FUJIAN_IP="172.28.4.77"
+HELONG_IP="172.28.4.85"
 
-HOST_IP="172.28.4.75"
+# ---------------------------------------------------------------
+# BF2 fabric IPs (100G switch — assigned to BF2 ARM ports)
+# ---------------------------------------------------------------
+TIANJIN_BF2_FABRIC="192.168.56.2"   # p1
+FUJIAN_BF2_FABRIC="192.168.56.3"    # p1
+HELONG_BF2_FABRIC="192.168.56.1"    # p0
+
+# ---------------------------------------------------------------
+# Local BF2 access (tmfifo — same on every host)
+# ---------------------------------------------------------------
 BF_IP="192.168.100.2"
 
-# BF2 PCI addresses
-HOST_PCI="0000:5e:00.0"  # BF2 as seen from host (full BDF)
-NIC_PCI="03:00.0"       # BF2 device as seen from ARM
+# ---------------------------------------------------------------
+# Master configuration
+# ---------------------------------------------------------------
+MASTER_HOST="${TIANJIN_IP}"
+MASTER_PORT="9000"
+# Port on tianjin BF2 that relays to master_monitor via tmfifo
+MASTER_BF2_RELAY_PORT="9100"
 
 # ---------------------------------------------------------------
-# Data output directory
+# PCI addresses (same across all three hosts)
+# ---------------------------------------------------------------
+HOST_PCI="0000:5e:00.0"     # BF2 as seen from host (DOCA 3.1 full BDF)
+NIC_PCI="03:00.0"           # BF2 device as seen from ARM
+
+# ---------------------------------------------------------------
+# Data output
 # ---------------------------------------------------------------
 DATA_DIR="${HOME}/exp_data"
-mkdir -p "${DATA_DIR}"/{A,B,C,kubelet}
+mkdir -p "${DATA_DIR}"/{A,B,C,kubelet} 2>/dev/null
 
 # ---------------------------------------------------------------
-# Binary paths
+# Binary paths (host side)
 # ---------------------------------------------------------------
 EXP_BASE="${HOME}/experiments"
 
@@ -28,19 +62,42 @@ GEMM_BENCH="${EXP_BASE}/bench/gemm_bench/gemm_bench"
 MOCK_SLAVE="${EXP_BASE}/bench/mock_slave/mock_slave"
 SLAVE_MONITOR="${EXP_BASE}/control-plane/slave/slave_monitor"
 MASTER_MONITOR="${EXP_BASE}/control-plane/master/master_monitor"
+METRIC_PUSH="${EXP_BASE}/bench/metric_push/metric_push"
 
 # Remote binary paths (on BF2 ARM)
 NIC_BENCH_NIC="/root/experiments/bench/latency_bench/bench_nic"
 NIC_FORWARD_ROUTINE="/root/experiments/control-plane/forwarder/forward_routine"
 
 # ---------------------------------------------------------------
-# Experiment parameters
+# Experiment B: Interference parameters
 # ---------------------------------------------------------------
-COMPUTE_CORES="4-7"          # CPU cores for gemm_bench (avoid core 0)
-HIGH_LOAD_INTERVAL=10        # ms — slave report interval under load (aggressive: 100 reports/s to stress compute cores)
-NORMAL_INTERVAL=1000         # ms — normal slave report interval
-BENCH_ITERS=10000            # ping-pong iterations per size
-GEMM_DURATION=60             # seconds per GEMM phase
+# GEMM uses one full NUMA socket (16 physical cores)
+NUMA_NODE=0
+GEMM_THREADS=16
 
-# DB connection (only needed if TimescaleDB is installed)
+# Number of slave_monitor / metric_push instances
+# (simulates kubelet + metrics + logging + health checks)
+N_MONITORS=8
+
+# Report interval per instance (ms)
+HIGH_LOAD_INTERVAL=10
+
+# Duration per scenario (seconds)
+GEMM_DURATION=60
+
+# ---------------------------------------------------------------
+# Experiment A: Latency parameters
+# ---------------------------------------------------------------
+BENCH_ITERS=10000
+BENCH_WARMUP=200
+
+# ---------------------------------------------------------------
+# Experiment C: Scalability
+# ---------------------------------------------------------------
+SCALE_NODES="4 16 64 256"
+SCALE_DURATION=30
+
+# ---------------------------------------------------------------
+# DB connection (optional — for master_monitor persistence)
+# ---------------------------------------------------------------
 DB_CONNSTR="host=localhost dbname=cluster_metrics user=postgres password=postgres"
