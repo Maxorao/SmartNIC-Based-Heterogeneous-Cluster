@@ -324,9 +324,27 @@ doca_error_t comch_host_send(comch_host_ctx_t *ctx, const void *msg, size_t len)
         return res;
     }
 
-    /* Spin PE until completion callback fires */
-    while (!ctx->send_done)
+    /* Spin PE until completion callback fires (with timeout + yield) */
+    struct timespec send_deadline;
+    clock_gettime(CLOCK_MONOTONIC, &send_deadline);
+    send_deadline.tv_sec += 1;   /* 1-second timeout */
+
+    while (!ctx->send_done) {
         doca_pe_progress(ctx->pe);
+
+        /* Yield 1µs to avoid burning CPU on a tight spin */
+        struct timespec yield = { .tv_sec = 0, .tv_nsec = 1000 };
+        nanosleep(&yield, NULL);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > send_deadline.tv_sec ||
+            (now.tv_sec == send_deadline.tv_sec &&
+             now.tv_nsec >= send_deadline.tv_nsec)) {
+            DOCA_LOG_WARN("comch_host_send: PE timeout (1s) — connection may be dead");
+            return DOCA_ERROR_TIME_OUT;
+        }
+    }
 
     return ctx->send_result;
 }

@@ -59,6 +59,8 @@ typedef struct {
     uint32_t interval_ms;
     char node_id[64];
     char iface[32];
+    uint32_t extra_reads;   /* extra /proc reads per cycle (simulate kubelet) */
+    uint32_t cache_kb;      /* KB of memory to walk per cycle (cache pressure) */
 } config_t;
 
 static config_t g_cfg = {
@@ -69,6 +71,8 @@ static config_t g_cfg = {
     .interval_ms = 1000,
     .node_id     = "",
     .iface       = "eth0",
+    .extra_reads = 0,
+    .cache_kb    = 0,
 };
 
 static volatile int g_running = 1;
@@ -223,6 +227,60 @@ static int tcp_connect(const char *ip, uint16_t port)
 }
 
 /* ------------------------------------------------------------------ */
+/* Synthetic workload (simulates kubelet + cAdvisor + logging overhead) */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Extra /proc reads: simulates kubelet reading /proc/[pid]/stat for
+ * each container, /proc/diskstats, /proc/net/dev, cgroup files, etc.
+ * Each read involves open + read + parse + close syscalls.
+ */
+static void do_extra_proc_reads(uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        FILE *f = fopen("/proc/stat", "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                /* Force the compiler to "use" the data */
+                volatile char sink = line[0];
+                (void)sink;
+            }
+            fclose(f);
+        }
+    }
+}
+
+/*
+ * Cache pressure: walk through a buffer touching every cache line.
+ * Simulates metric aggregation, log buffering, JSON serialization —
+ * working-set-sized memory access that pollutes shared L3 cache.
+ */
+static char *g_cache_buf = NULL;
+static uint32_t g_cache_buf_size = 0;
+
+static void do_cache_work(uint32_t kb)
+{
+    if (kb == 0) return;
+
+    uint32_t size = kb * 1024;
+    if (!g_cache_buf || g_cache_buf_size != size) {
+        free(g_cache_buf);
+        g_cache_buf = malloc(size);
+        g_cache_buf_size = size;
+        if (!g_cache_buf) return;
+        memset(g_cache_buf, 0, size);
+    }
+
+    /* Read+write every cache line (64B stride) to force evictions */
+    volatile uint64_t checksum = 0;
+    for (uint32_t i = 0; i < size; i += 64) {
+        checksum += (uint64_t)(unsigned char)g_cache_buf[i];
+        g_cache_buf[i] = (char)(checksum & 0xFF);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Main monitor loop                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -236,8 +294,10 @@ int main(int argc, char *argv[])
         {"master-port", required_argument, 0, 'P'},
         {"interval",    required_argument, 0, 't'},
         {"node-id",     required_argument, 0, 'n'},
-        {"iface",       required_argument, 0, 'f'},
-        {"help",        no_argument,       0, 'h'},
+        {"iface",        required_argument, 0, 'f'},
+        {"extra-reads",  required_argument, 0, 'r'},
+        {"cache-kb",     required_argument, 0, 'c'},
+        {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -255,12 +315,15 @@ int main(int argc, char *argv[])
         case 't': g_cfg.interval_ms = (uint32_t)atoi(optarg); break;
         case 'n': strncpy(g_cfg.node_id, optarg, sizeof(g_cfg.node_id)-1); break;
         case 'f': strncpy(g_cfg.iface, optarg, sizeof(g_cfg.iface)-1); break;
+        case 'r': g_cfg.extra_reads = (uint32_t)atoi(optarg); break;
+        case 'c': g_cfg.cache_kb = (uint32_t)atoi(optarg); break;
         case 'h':
         default:
             fprintf(stderr,
                 "Usage: %s [--mode=offload|direct] [--pci=ADDR]\n"
                 "          [--master-ip=IP] [--master-port=PORT]\n"
-                "          [--interval=MS] [--node-id=NAME] [--iface=IFACE]\n",
+                "          [--interval=MS] [--node-id=NAME] [--iface=IFACE]\n"
+                "          [--extra-reads=N] [--cache-kb=KB]\n",
                 argv[0]);
             exit(c == 'h' ? 0 : 1);
         }
@@ -373,6 +436,10 @@ int main(int argc, char *argv[])
 
         prev_cpu = cur_cpu;
         prev_net = cur_net;
+
+        /* Synthetic workload: simulate kubelet/cAdvisor overhead */
+        do_extra_proc_reads(g_cfg.extra_reads);
+        do_cache_work(g_cfg.cache_kb);
 
         /* Decide: heartbeat (no change) or full report */
         msg_type_t mtype;

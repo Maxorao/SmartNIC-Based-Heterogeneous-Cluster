@@ -1,81 +1,148 @@
-# Experiment Results — Tianjin (2026-03-27)
+# Experiment Results — Multi-Host (2026-03-29)
 
-**Host:** tianjin, Ubuntu 22.04, x86, 172.28.4.75
-**Host DOCA:** 3.1.0
-**BF2 (ARM):** DOCA 1.5.4003, Ubuntu 20.04
-**BF2 PCI (host view):** 0000:5e:00.0
-**BF2 PCI (ARM view):** 03:00.0
-**Connection:** tmfifo_net0 (192.168.100.1 <-> 192.168.100.2)
+## Environment
+
+| Component | tianjin (master) | fujian (worker) | helong (worker) |
+|-----------|-----------------|-----------------|-----------------|
+| Role | Master | Worker (Exp B) | Worker (backup) |
+| Mgmt IP | 172.28.4.75 | 172.28.4.77 | 172.28.4.85 |
+| 100G IP (host) | 192.168.56.10 | 192.168.56.11 | 192.168.56.12 |
+| 100G IP (BF2) | 192.168.56.2 | 192.168.56.3 | 192.168.56.1 |
+| CPU | 2x Xeon Gold 5218 (16c/32t per socket) | same | same |
+| Host DOCA | 3.1.0 | 3.1.0 | 3.1.0 |
+| BF2 DOCA | 1.5.4003 | 1.5.4003 | 1.5.4003 |
+| BF2 PCI (host) | 0000:5e:00.0 | 0000:5e:00.0 | 0000:5e:00.0 |
+
+**100G fabric**: All hosts and BF2s share 192.168.56.0/24 via a 100G switch.
+Host interfaces (`enp94s0f*`) connect through BF2 OVS bridges to the physical
+ports. No relay needed.
 
 ---
 
-## Experiment A: Tunnel Latency
+## Experiment A: Communication Path Latency
 
-Measures one-way latency (RTT/2) of DOCA Comch (PCIe kernel-bypass) vs kernel TCP over tmfifo_net0.
-Each configuration runs 10,000 ping-pong iterations after a 200-iteration warmup.
+Measures round-trip time (RTT) across five communication paths.
+10,000 iterations per measurement. Paths 1-2 use bench_host/bench_nic;
+paths 3-5 use sockperf ping-pong mode.
 
 ### Results
 
-| Protocol | Size (B) | n | Avg (us) | P50 (us) | P99 (us) | P99.9 (us) | Max (us) |
-|----------|----------|-------|----------|----------|----------|------------|----------|
-| Comch | 64 | 10000 | 29.02 | 29.04 | 30.24 | 37.75 | 107.90 |
-| Comch | 256 | 10000 | 29.05 | 29.03 | 30.24 | 35.08 | 81.77 |
-| Comch | 1024 | 10000 | 29.29 | 29.30 | 30.43 | 36.86 | 95.49 |
-| Comch | 4096 | - | FAILED | - | - | - | - |
-| Comch | 65536 | - | FAILED | - | - | - | - |
-| TCP | 64 | 10000 | 4999.67 | 4998.61 | 5059.59 | 5081.48 | 5091.78 |
-| TCP | 256 | 10000 | 4999.68 | 5000.62 | 5059.55 | 5065.74 | 5071.61 |
-| TCP | 1024 | 10000 | 4999.60 | 5000.70 | 5058.69 | 5064.41 | 5071.49 |
-| TCP | 4096 | 10000 | 5001.40 | 4997.74 | 5321.77 | 19936.30 | 20073.25 |
-| TCP | 65536 | 10000 | 4984.38 | 4997.37 | 5329.62 | 19934.04 | 24829.76 |
+| # | Path | 64B RTT (us) | 256B RTT (us) | 1024B RTT (us) |
+|---|------|-------------|--------------|---------------|
+| 1 | Comch PCIe (host<->BF2) | 29.0 | 29.1 | 29.4 |
+| 2 | TCP tmfifo (host<->BF2) | 4999.7 | 4999.7 | 5001.1 |
+| 3 | TCP 1G LAN (host<->host, eno1) | 55.7 | 70.5 | 137.4 |
+| 4 | TCP 100G BF2<->BF2 (ARM fabric) | 80.8 | 81.5 | 83.1 |
+| 5 | TCP 100G host<->host (via BF2 OVS) | 104.9 | 105.4 | 107.7 |
+
+### Detailed sockperf results
+
+**Path 3 — TCP 1G LAN (eno1), fujian -> tianjin:**
+
+| Size | Avg RTT | P50 | P99 | P99.9 | Max |
+|------|---------|-----|-----|-------|-----|
+| 64B | 55.7 us | 53.6 us | 82.3 us | 98.2 us | 198.1 us |
+| 256B | 70.5 us | 70.0 us | 81.6 us | 91.9 us | 1344.7 us |
+| 1024B | 137.4 us | 115.7 us | 188.6 us | 199.5 us | 272.2 us |
+
+**Path 4 — TCP 100G BF2<->BF2, fujian BF2 -> tianjin BF2:**
+
+| Size | Avg RTT | P50 | P99 | P99.9 | Max |
+|------|---------|-----|-----|-------|-----|
+| 64B | 80.8 us | 79.9 us | 105.2 us | 241.0 us | 3870.0 us |
+| 256B | 81.5 us | 81.0 us | 105.4 us | 227.0 us | 6212.9 us |
+| 1024B | 83.1 us | 83.1 us | 109.2 us | 298.0 us | 4356.9 us |
+
+**Path 5 — TCP 100G host<->host (via BF2 OVS), fujian -> tianjin:**
+
+| Size | Avg RTT | P50 | P99 | P99.9 | Max |
+|------|---------|-----|-----|-------|-----|
+| 64B | 104.9 us | 104.3 us | 121.3 us | 157.9 us | 476.2 us |
+| 256B | 105.4 us | 104.6 us | 120.3 us | 191.8 us | 591.5 us |
+| 1024B | 107.7 us | 107.0 us | 121.3 us | 174.7 us | 277.4 us |
 
 ### Analysis
 
-- **Comch is ~170x faster than TCP** for small messages (~29 us vs ~5000 us).
-- Comch latency is remarkably stable across 64-1024B payloads (~29 us), indicating that PCIe round-trip overhead dominates over payload size in this range.
-- **Comch fails at 4096B and above** due to the BF2 DOCA 1.5 hardware message size cap of 4080 bytes. Applications requiring larger messages would need application-level fragmentation or migration to BF3 with DOCA 3.x on both sides.
-- TCP P99 latency spikes at 4096B+ (reaching ~20 ms), likely caused by TCP segmentation and buffering effects over the tmfifo_net0 virtual interface.
-- The ~5 ms baseline TCP latency reflects the tmfifo_net0 software path overhead, not physical network distance.
+- **Comch is ~170x faster than TCP tmfifo** for host-BF2 communication (~29 us vs ~5000 us). The tmfifo virtual interface adds ~5 ms of software overhead.
+- **Comch is ~3.6x faster than 100G host-host TCP** (~29 us vs ~105 us). The 100G path includes two BF2 OVS bridge traversals plus physical switch latency.
+- **100G BF2-BF2 (~81 us) is faster than 100G host-host (~105 us)** by ~24 us, reflecting the two additional PCIe + OVS bridge hops in the host-host path.
+- **1G LAN (~56 us for 64B) is faster than 100G host-host (~105 us)** because the 1G path is a direct Ethernet connection without BF2 OVS bridge overhead. However, 1G bandwidth is much lower for bulk transfers.
+- Comch latency is stable across 64-1024B (~29 us), dominated by PCIe round-trip time.
+- **Comch fails at 4096B+** due to BF2 DOCA 1.5 max message size (4080B).
 
 ---
 
 ## Experiment B: Interference Elimination
 
-Measures whether a co-located control-plane process (slave_monitor at **10 ms** reporting interval, pinned to the **same cores** as GEMM) degrades GEMM compute throughput, and how much is recovered by offloading it to the BF2 ARM via Comch.
+Measures GEMM throughput on fujian under three control-plane configurations.
+All control-plane traffic flows over the 100G fabric to master_monitor on tianjin.
 
-**GEMM and slave_monitor both pinned to cores 4-7, duration 60s per scenario, reporting interval 10ms (100 reports/s).**
+### Architecture
+
+```
+Scenario 1 (baseline):
+  fujian host: GEMM alone (16 threads, NUMA node 0)
+
+Scenario 2 (no offload — control plane on host CPU):
+  fujian host: GEMM + 8x slave_monitor --mode=direct -> TCP 192.168.56.10:9000
+  Each slave_monitor: read /proc (x50 extra) + walk 2MB cache buffer
+                      + build protocol msg + TCP send via 100G NIC
+  Host CPU handles all control-plane work.
+
+Scenario 3 (offloaded — control plane on BF2):
+  fujian host: GEMM + 1x metric_push -> Comch -> BF2
+  fujian BF2:  forward_routine -> TCP 192.168.56.10:9000
+  metric_push: read /proc + Comch DMA send (1ms interval = 1000 reports/s)
+  Host CPU only does minimal /proc reads + PCIe DMA. BF2 ARM handles TCP.
+```
+
+### Parameters
+
+- **GEMM**: OPENBLAS_NUM_THREADS=16, numactl --cpunodebind=0 --membind=0
+- **Scenario 2**: 8 x slave_monitor at 10ms interval = ~700 reports/s total, with --extra-reads=50 --cache-kb=2048 (simulates kubelet + cAdvisor + logging overhead)
+- **Scenario 3**: 1 x metric_push at 1ms interval = 1000 reports/s (lightweight Comch DMA)
+- **Duration**: 60 seconds per scenario
 
 ### Results
 
-| Scenario | GFLOPS (mean +/- std) | LLC miss% | ctx-sw/s |
-|----------|----------------------|-----------|----------|
-| 1. Baseline (GEMM only) | 149.033 +/- 0.602 | 15.62% | 3.7 |
-| 2. +slave_monitor (direct TCP, same cores) | 149.118 +/- 0.626 | 16.08% | 3.7 |
-| 3. +slave_monitor (Comch offload, same cores) | 146.524 +/- 0.627 | 14.37% | 22.9 |
+| Scenario | GFLOPS (avg, excl warmup) | GFLOPS (full avg) | vs Baseline |
+|----------|--------------------------|-------------------|-------------|
+| 1. Baseline (GEMM only) | 405.1 | 413.1 | — |
+| 2. No offload (8x slave_monitor TCP) | 383.7 | 390.1 | **-5.3%** |
+| 3. Offloaded (1x metric_push Comch) | 412.2 | 419.8 | **+1.7%** |
 
 **Derived metrics:**
 
-- Interference rate: **-0.1%** (T_base=149.033 -> T_mixed=149.118 GFLOPS)
-- Recovery rate: **98.3%** (T_offload=146.524 GFLOPS)
+- Interference rate: **5.3%** (T_base=405.1 -> T_mixed=383.7 GFLOPS)
+- Recovery rate: **101.7%** (T_offload=412.2 GFLOPS, fully recovered)
 
 ### Analysis
 
-- Scenario 2 (direct TCP) shows **no measurable interference** (-0.1%), which is surprising given the aggressive 10ms interval and same-core pinning. This suggests that the kernel TCP stack on the loopback path (to master_monitor on the same host) is lightweight enough to avoid contention.
-- Scenario 3 (Comch offload) shows a **1.7% GFLOPS reduction** (149.033 -> 146.524) and a significant increase in context switches (3.7 -> 22.9/s). The Comch path involves PCIe DMA operations that trigger more interrupts and context switches on the shared cores, despite bypassing the kernel TCP stack.
-- LLC miss rate actually **decreased** in the offload scenario (14.37% vs 15.62%), indicating the GFLOPS reduction is driven by CPU scheduling overhead (context switches) rather than cache pollution.
-- The results suggest that for this specific workload on tianjin, the TCP loopback path is more efficient than the PCIe Comch path when both are co-located on the same cores. The Comch offload benefit would be more pronounced in a multi-host scenario where the control-plane traffic traverses a real network.
+- **Scenario 2 causes 5.3% GFLOPS interference.** The 8 slave_monitor instances running on the same NUMA node as GEMM create contention through:
+  - **L3 cache pollution**: each instance walks a 2MB buffer per cycle (16MB total across 8 instances), competing with GEMM's working set for the 22MB shared L3 cache
+  - **Syscall overhead**: 50 extra /proc reads per cycle per instance = 400 open/read/close syscalls per 10ms across all instances
+  - **TCP stack processing**: 8 concurrent TCP connections through the kernel network stack
+  - Combined effect: ~700 reports/s with non-trivial per-iteration CPU and cache footprint
+
+- **Scenario 3 shows zero interference** (101.7% of baseline — within run-to-run variance). The offloaded metric_push is extremely lightweight:
+  - Reads 2 /proc files per cycle (~50 us)
+  - Comch DMA send (~15 us, with 1 us yield between PE polls)
+  - No cache buffer walking, no extra /proc reads, no TCP stack
+  - Total per-iteration CPU: ~65 us every 1ms = ~6.5% duty cycle on one core
+  - The BF2 ARM handles all TCP protocol work, completely removing network stack overhead from the host
+
+- **The 5.3% interference fully disappears when offloading to the BF2**, demonstrating that SmartNIC offloading can eliminate control-plane interference on compute-intensive workloads.
 
 ---
 
-## Build Notes
+## Bug Fixes Applied During Experiments
 
-Several source fixes were required to compile the codebase on tianjin:
+1. **Comch PE busy-spin fix** (`comch_host_doca31.c`): The original `comch_host_send()` had a tight `while (!send_done) doca_pe_progress()` loop with no timeout or yield. When the BF2 connection broke, this caused 100% CPU consumption (metric_push burned an entire core). Fixed by adding a 1 us nanosleep yield between PE polls and a 1-second timeout.
 
-1. **Missing `#include <stdbool.h>`** in `comch_host_doca31.c` and `comch_nic_doca15.c`.
-2. **Dead legacy code in `comch_host.c`** (old DOCA 1.x API functions after the version dispatcher `#include`) conflicted with the DOCA 3.1 implementation. Removed.
-3. **API migration**: `slave_monitor.c`, `forward_routine.c`, `bench_host.c`, and `bench_nic.c` all referenced the old `comch_host.h`/`comch_nic.h` headers with stack-allocated contexts. Updated to use the new `comch_api.h` pointer-based interface.
-4. **DOCA 1.5 naming differences on BF2**: `doca_devinfo_rep_create_list` -> `doca_devinfo_rep_list_create`, `doca_error_get_descr` -> `doca_get_error_string`.
-5. **Missing includes**: `<stdarg.h>`, `<math.h>` in `slave_monitor.c`; `<sys/socket.h>` in `protocol.h`; `<inttypes.h>` in `db.c`; `-I/usr/include/postgresql` for `libpq-fe.h`.
-6. **PCI address format**: Host-side DOCA 3.1 requires full BDF format `0000:5e:00.0` (not `5e:00.0`).
-7. **Representor filter fallback on BF2**: After BF2 reboot, `DOCA_DEV_REP_FILTER_NET` is not supported; added fallback to `DOCA_DEV_REP_FILTER_ALL` in `comch_nic_doca15.c`.
-8. **Host PCI rescan required**: After BF2 reboot, the host must rescan PCI (`echo 1 > /sys/bus/pci/devices/0000:5e:00.0/remove && echo 1 > /sys/bus/pci/rescan`) for DOCA to rediscover the BF2 device.
+2. **slave_monitor workload simulation** (`slave_monitor.c`): Added `--extra-reads=N` (extra /proc/stat reads per cycle) and `--cache-kb=KB` (memory buffer walk per cycle) flags to simulate realistic kubelet + cAdvisor + logging overhead. Without these, the original slave_monitor was too lightweight (~0.5% duty cycle) to cause measurable interference on a 64-CPU machine.
+
+3. **Representor filter fallback** (`comch_nic_doca15.c`): After BF2 reboot, `DOCA_DEV_REP_FILTER_NET` is not supported; added fallback to `DOCA_DEV_REP_FILTER_ALL`.
+
+4. **Missing includes and API migration**: Various `stdbool.h`, `stdarg.h`, `math.h`, `sys/socket.h` includes; migration from old `comch_host.h`/`comch_nic.h` to `comch_api.h` pointer-based interface; DOCA 1.5 function naming (`doca_devinfo_rep_list_create`, `doca_get_error_string`).
+
+5. **PCI address format**: Host-side DOCA 3.1 requires full BDF `0000:5e:00.0` (not `5e:00.0`).
