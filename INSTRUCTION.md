@@ -566,13 +566,65 @@ Repeat on helong (172.28.4.85).  Replace `172.28.4.77` with `172.28.4.85`,
 
 ---
 
-## 8. Experiment C — Scalability (deferred)
+## 8. Experiment C — Control-Plane Scalability
 
-Will be designed after Chapter 2 experiments are validated.
+Tests master_monitor scalability as node count increases from 4 to 256.
+Mock nodes (pthreads in mock_slave) connect via 100G fabric to master.
 
-- Master: tianjin host
-- Real workers: fujian + helong (2 real nodes)
-- Mock workers: Docker containers for scale (8, 32, 128 total)
+### Architecture
+
+```
+tianjin (192.168.56.10)
+  master_monitor :9000    ← receives TCP from all mock nodes
+        ▲
+        │ TCP via 100G fabric (192.168.56.x)
+  ┌─────┴──────┬──────────────┐
+  fujian       helong
+  mock_slave   mock_slave
+  (N/2 nodes)  (N/2 nodes)
+```
+
+### Parameters
+
+- **Scale points**: 4, 16, 64, 256 nodes
+- **Report interval**: 1000 ms (1 report per node per second)
+- **Warmup**: 10 seconds (all nodes register before measurement)
+- **Measurement**: 30 seconds (pidstat sampling)
+
+### Run
+
+```bash
+cd ~/experiments
+chmod +x scripts/exp_C_scale.sh
+bash scripts/exp_C_scale.sh
+```
+
+The script will:
+1. For each scale point N: start master_monitor on tianjin
+2. Launch mock_slave with N/2 threads on fujian and N/2 on helong
+3. Wait 10s for registration, then pidstat master_monitor for 30s
+4. Collect mock_slave latency stats, stop everything, move to next N
+
+### After completion
+
+```bash
+python3 scripts/analyze/analyze_C.py
+```
+
+Prints table: nodes, master CPU%, RSS MB, avg latency, reports/s, error rate.
+Also fits a linear model for CPU% vs node count.
+
+### Optional: high-frequency stress test
+
+Re-run with 100ms interval (10× the report rate):
+
+```bash
+bash scripts/exp_C_scale.sh --interval=100
+```
+
+At 256 nodes × 10 reports/s = 2560 reports/s — tests master under heavy load.
+
+**Data to collect**: paste the printed table and linear fit here
 
 ---
 

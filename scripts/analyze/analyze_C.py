@@ -1,127 +1,144 @@
 #!/usr/bin/env python3
 """
-Experiment C: Master-Monitor Scalability Analysis
+Experiment C: Control-Plane Scalability Analysis
 
-Reads pidstat output for master_monitor at node counts [4, 16, 64, 256]
+Reads pidstat + mock_slave output for node counts [4, 16, 64, 256]
 and produces:
-  1. Console table: node count, avg CPU%, avg MEM MB, P99 latency
-  2. summary.csv  — for LaTeX table / pgfplots
+  1. Console table: nodes, CPU%, RSS MB, avg latency, error rate
+  2. summary.csv for LaTeX / pgfplots
 
 Input files (in ~/exp_data/C/):
-  master_{N}nodes.txt   — pidstat -u -r output for master_monitor
-  latency_{N}nodes.txt  — P99 latency lines from master_monitor log
+  pidstat_{N}nodes.txt          — pidstat -u -r output for master_monitor
+  mock_{N}nodes_{ip}.txt        — mock_slave output per worker host
 """
 
 import os
 import re
 import sys
+import glob
+import csv
 import numpy as np
 
 DATA_DIR    = os.path.expanduser("~/exp_data/C")
 NODE_COUNTS = [4, 16, 64, 256]
 
 
-def parse_pidstat_cpu_mem(path: str) -> tuple[float, float]:
-    """
-    Parse pidstat -u -r output.
-    Returns (avg_%CPU, avg_MEM_MB).
-    pidstat columns (with -u):
-      Time  UID  PID  %usr  %system  %guest  %wait  %CPU  CPU  Command
-    pidstat columns (with -r, following the CPU block):
-      Time  UID  PID  minflt/s  majflt/s  VSZ  RSS  %MEM  Command
-    """
-    cpus, mems_kb = [], []
+def parse_pidstat(path: str):
+    """Parse pidstat -u -r output. Returns (avg_cpu%, avg_rss_mb)."""
+    cpus, rss_kb = [], []
     try:
         with open(path) as f:
-            in_cpu_section = False
             for line in f:
-                # pidstat prints a header line before each block
-                if "%CPU" in line and "CPU" in line:
-                    in_cpu_section = True
+                parts = line.split()
+                if len(parts) < 8 or parts[-1] != "master_monitor":
                     continue
-                if "%MEM" in line and "RSS" in line:
-                    in_cpu_section = False
-                    continue
-                if in_cpu_section:
-                    parts = line.split()
-                    # Last column is Command; %CPU is at index 7
-                    if len(parts) >= 9 and parts[-1] == "master_monitor":
-                        try:
-                            cpus.append(float(parts[7]))
-                        except (ValueError, IndexError):
-                            pass
-                else:
-                    # Memory section: RSS (KB) at index 6
-                    parts = line.split()
-                    if len(parts) >= 8 and parts[-1] == "master_monitor":
-                        try:
-                            mems_kb.append(float(parts[6]))
-                        except (ValueError, IndexError):
-                            pass
+                # CPU section: col 7 is %CPU
+                try:
+                    val = float(parts[7])
+                    # Distinguish CPU vs memory by checking if col 6 looks like RSS (large int)
+                    # In CPU section: col 7 = %CPU (0-100)
+                    # In memory section: col 6 = RSS (KB, typically >1000)
+                    if float(parts[6]) > 500:
+                        # This is memory section — col 6 = RSS
+                        rss_kb.append(float(parts[6]))
+                    else:
+                        cpus.append(val)
+                except (ValueError, IndexError):
+                    pass
     except FileNotFoundError:
         print(f"  [WARN] {path} not found", file=sys.stderr)
 
-    avg_cpu = float(np.mean(cpus))  if cpus    else float("nan")
-    avg_mem = float(np.mean(mems_kb)) / 1024.0 if mems_kb else float("nan")   # KB → MB
-    return avg_cpu, avg_mem
+    avg_cpu = float(np.mean(cpus)) if cpus else float("nan")
+    avg_rss = float(np.mean(rss_kb)) / 1024.0 if rss_kb else float("nan")
+    return avg_cpu, avg_rss
 
 
-def parse_p99_latency(path: str) -> float:
+def parse_mock_outputs(n: int):
     """
-    Extract P99 latency (ms) from master_monitor log lines like:
-      [STATS] p99_latency=2.34ms  or  p99_latency: 2.34
-    Returns the mean of all found values, or NaN.
+    Parse all mock_{N}nodes_*.txt files.
+    Returns (total_sent, total_acked, total_errors, avg_latency_us).
     """
-    vals = []
-    try:
-        with open(path) as f:
-            for line in f:
-                m = re.search(r"p99_latency[=:\s]+([\d.]+)", line, re.IGNORECASE)
-                if m:
-                    vals.append(float(m.group(1)))
-    except FileNotFoundError:
-        pass
-    return float(np.mean(vals)) if vals else float("nan")
+    pattern = os.path.join(DATA_DIR, f"mock_{n}nodes_*.txt")
+    files = glob.glob(pattern)
+
+    total_sent = total_acked = total_errors = 0
+    total_lat = 0.0
+    lat_count = 0
+
+    for f in files:
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    # Look for: TOTAL: sent=1234  acked=1234  errors=0  avg_lat=123.4 us
+                    m = re.search(
+                        r"TOTAL:\s+sent=(\d+)\s+acked=(\d+)\s+errors=(\d+)\s+avg_lat=([\d.]+)",
+                        line
+                    )
+                    if m:
+                        s, a, e, lat = int(m[1]), int(m[2]), int(m[3]), float(m[4])
+                        total_sent += s
+                        total_acked += a
+                        total_errors += e
+                        if a > 0:
+                            total_lat += lat * a
+                            lat_count += a
+        except FileNotFoundError:
+            pass
+
+    avg_lat = total_lat / lat_count if lat_count > 0 else float("nan")
+    return total_sent, total_acked, total_errors, avg_lat
 
 
-def analyze() -> None:
+def analyze():
     results = []
     for n in NODE_COUNTS:
-        cpu_path = os.path.join(DATA_DIR, f"master_{n}nodes.txt")
-        lat_path = os.path.join(DATA_DIR, f"latency_{n}nodes.txt")
-
-        avg_cpu, avg_mem = parse_pidstat_cpu_mem(cpu_path)
-        p99_lat          = parse_p99_latency(lat_path)
+        pidstat_path = os.path.join(DATA_DIR, f"pidstat_{n}nodes.txt")
+        avg_cpu, avg_rss = parse_pidstat(pidstat_path)
+        sent, acked, errors, avg_lat = parse_mock_outputs(n)
+        err_rate = (errors / sent * 100) if sent > 0 else 0.0
+        reports_per_sec = acked / 30.0 if acked > 0 else 0.0  # 30s measurement
 
         results.append({
-            "nodes"    : n,
-            "cpu_pct"  : avg_cpu,
-            "mem_mb"   : avg_mem,
-            "p99_ms"   : p99_lat,
+            "nodes": n,
+            "cpu_pct": avg_cpu,
+            "rss_mb": avg_rss,
+            "avg_lat_us": avg_lat,
+            "reports_sec": reports_per_sec,
+            "sent": sent,
+            "acked": acked,
+            "errors": errors,
+            "err_rate": err_rate,
         })
 
-    print("\n=== Experiment C: Master-Monitor Scalability ===")
-    print(f"{'Nodes':>8}  {'CPU (%)':>10}  {'MEM (MB)':>10}  {'P99 latency (ms)':>18}")
-    print("-" * 54)
+    # Print table
+    print("\n=== Experiment C: Control-Plane Scalability ===\n")
+    hdr = f"{'Nodes':>6}  {'CPU%':>7}  {'RSS MB':>8}  {'Avg Lat (us)':>13}  {'Reports/s':>10}  {'Errors':>7}  {'Err%':>6}"
+    print(hdr)
+    print("-" * len(hdr))
     for r in results:
-        print(f"{r['nodes']:>8}  {r['cpu_pct']:>10.4f}  {r['mem_mb']:>10.2f}  {r['p99_ms']:>18.3f}")
+        print(f"{r['nodes']:>6}  {r['cpu_pct']:>7.2f}  {r['rss_mb']:>8.1f}  "
+              f"{r['avg_lat_us']:>13.1f}  {r['reports_sec']:>10.1f}  "
+              f"{r['errors']:>7}  {r['err_rate']:>5.1f}%")
 
-    # Fit linear model for CPU vs nodes
+    # Linear fit for CPU vs nodes
     nodes = np.array([r["nodes"] for r in results if not np.isnan(r["cpu_pct"])])
     cpus  = np.array([r["cpu_pct"] for r in results if not np.isnan(r["cpu_pct"])])
     if len(nodes) >= 2:
         slope, intercept = np.polyfit(nodes, cpus, 1)
-        print(f"\n  CPU linear fit: {slope*1000:.4f}‰ per node  (R² ≈ "
-              f"{np.corrcoef(nodes, cpus)[0,1]**2:.4f})")
+        r2 = np.corrcoef(nodes, cpus)[0, 1] ** 2
+        print(f"\n  CPU linear fit: {slope:.4f}% per node + {intercept:.2f}%  (R²={r2:.4f})")
+        print(f"  Projected CPU at 1000 nodes: {slope * 1000 + intercept:.1f}%")
 
-    # Save summary CSV
-    import csv
+    # Save CSV
     out = os.path.join(DATA_DIR, "summary.csv")
     with open(out, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["nodes", "cpu_pct", "mem_mb", "p99_ms"])
+        w = csv.DictWriter(f, fieldnames=[
+            "nodes", "cpu_pct", "rss_mb", "avg_lat_us", "reports_sec",
+            "sent", "acked", "errors", "err_rate"
+        ])
         w.writeheader()
         w.writerows(results)
-    print(f"\nSummary saved → {out}")
+    print(f"\n  Summary saved → {out}")
 
 
 if __name__ == "__main__":
