@@ -14,102 +14,109 @@ proceed until it passes.
     ┌─────────────────┬─────────────────┬─────────────────┐
     │  tianjin .75    │  fujian .77     │  helong .85     │
     │  MASTER         │  WORKER         │  WORKER         │
-    │  tmfifo .100.1  │  tmfifo .100.1  │  tmfifo .100.1  │
-    │  ↕ PCIe         │  ↕ PCIe         │  ↕ PCIe         │
-    │  BF2 .100.2     │  BF2 .100.2     │  BF2 .100.2     │
-    │  p1:56.2        │  p1:56.3        │  p0:56.1        │
+    │                 │                 │                 │
+    │  enp94s0f1np1   │  enp94s0f1np1   │  enp94s0f0np0   │
+    │  192.168.56.10  │  192.168.56.11  │  192.168.56.12  │
+    │  ↕ PCIe+OVS     │  ↕ PCIe+OVS     │  ↕ PCIe+OVS     │
+    │  BF2 p1: .56.2  │  BF2 p1: .56.3  │  BF2 p0: .56.1  │
     └────────┬────────┘────────┬────────┘────────┬────────┘
              └─────────────────┴─────────────────┘
                   192.168.56.0/24 (100G switch)
 ```
 
-### Communication paths
-
-| Path | From → To | Use |
-|------|-----------|-----|
-| Comch (PCIe) | host ↔ local BF2 | Tunnel: host metric_push/slave_monitor ↔ BF2 |
-| tmfifo | host ↔ local BF2 | SSH management |
-| 100G fabric | BF2 ↔ BF2 | Offloaded control-plane messages |
-| eno1 LAN | host ↔ host | Baseline TCP + SSH between hosts |
+All devices (hosts via enp94s0f* AND BF2 ARMs via p0/p1) share the same
+192.168.56.0/24 subnet.  OVS on each BF2 bridges the host representor
+(pf*hpf) to the physical port (p0/p1), so all devices can reach each
+other transparently.  **No relay or socat needed.**
 
 ### Key facts
 
-- Each host has 2 sockets × 16 cores × 2 HT = 64 logical CPUs (Xeon Gold 5218 @ 2.30 GHz)
-- Each BF2 ARM has 8 cores (Cortex-A72)
+- Each host: 2 sockets × 16 cores × 2 HT = 64 logical CPUs (Xeon Gold 5218 @ 2.30 GHz)
+- Each BF2 ARM: 8 cores (Cortex-A72)
 - Host DOCA 3.1 (`libdoca_comch`), BF2 DOCA 1.5 (`libdoca_comm_channel`)
 - BF2 PCI from host: `0000:5e:00.0`; from ARM: `03:00.0`
-- SSH to BF2: `ssh root@192.168.100.2` (no password)
+- SSH to local BF2: `ssh root@192.168.100.2` (no password, via tmfifo)
+
+### Communication paths
+
+| # | Path | From → To | Use |
+|---|------|-----------|-----|
+| ① | Comch (PCIe) | Host ↔ local BF2 ARM | Tunnel: metric_push → BF2 |
+| ② | TCP tmfifo | Host ↔ local BF2 ARM | SSH management, baseline |
+| ③ | TCP eno1 LAN | Host ↔ Host (1G) | SSH between hosts, baseline |
+| ④ | TCP 100G BF2↔BF2 | BF2 ARM ↔ BF2 ARM | SmartNIC fabric latency |
+| ⑤ | TCP 100G host↔host | Host ↔ Host (via BF2 OVS) | E2E 100G fabric, control plane |
 
 ---
 
-## 1. BF2 Fabric Network Setup
+## 1. Network Setup (100G fabric)
 
-Assign IPs to the switch-connected BF2 ports so all three BF2 ARMs can
-communicate over the 100G fabric.
+### 1a. BF2 ARM port IPs
 
-**helong BF2 p0 already has 192.168.56.1.**  Configure tianjin and fujian:
+helong BF2 p0 already has 192.168.56.1.  Configure tianjin and fujian:
 
 ```bash
-# On tianjin (this machine):
+# tianjin BF2:
 ssh root@192.168.100.2 "ip addr add 192.168.56.2/24 dev p1 2>/dev/null; ip link set p1 up"
 
-# On fujian:
-ssh root@192.168.100.2 -J none -o ProxyCommand="ssh -W %h:%p $(whoami)@172.28.4.77" \
-  "ip addr add 192.168.56.3/24 dev p1 2>/dev/null; ip link set p1 up"
-```
-
-If the ProxyCommand approach is difficult, SSH into fujian first, then SSH to its BF2:
-
-```bash
+# fujian BF2 (via fujian host):
 ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'ip addr add 192.168.56.3/24 dev p1 2>/dev/null; ip link set p1 up'"
 ```
 
-**Verify (from tianjin BF2):**
+### 1b. Host-side 100G interface IPs
+
+These interfaces connect to the same switch via the BF2 OVS bridge:
+
 ```bash
+# tianjin:
+sudo ip link set enp94s0f1np1 up
+sudo ip addr add 192.168.56.10/24 dev enp94s0f1np1 2>/dev/null
+
+# fujian:
+ssh $(whoami)@172.28.4.77 "
+  sudo ip link set enp94s0f1np1 up
+  sudo ip addr add 192.168.56.11/24 dev enp94s0f1np1 2>/dev/null
+"
+
+# helong:
+ssh $(whoami)@172.28.4.85 "
+  sudo ip link set enp94s0f0np0 up
+  sudo ip addr add 192.168.56.12/24 dev enp94s0f0np0 2>/dev/null
+"
+```
+
+### 1c. Verify connectivity
+
+```bash
+# From tianjin host — can reach other hosts via 100G?
+ping -c 2 -I enp94s0f1np1 192.168.56.11 && echo "fujian host OK"
+ping -c 2 -I enp94s0f1np1 192.168.56.12 && echo "helong host OK"
+
+# From tianjin BF2 — can reach tianjin host via OVS?
+ssh root@192.168.100.2 "ping -c 2 192.168.56.10 && echo 'host via OVS OK'"
+
+# From tianjin BF2 — can reach other BF2s via 100G?
 ssh root@192.168.100.2 "
-  ping -c 2 192.168.56.1 && echo 'helong BF2 OK' &&
+  ping -c 2 192.168.56.1 && echo 'helong BF2 OK'
   ping -c 2 192.168.56.3 && echo 'fujian BF2 OK'
 "
+
+# Critical: can fujian BF2 reach tianjin host?
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'ping -c 2 192.168.56.10 && echo fujian-BF2-to-tianjin-host OK'"
 ```
 
-All three BF2s must be able to reach each other on 192.168.56.0/24.
+All pings must succeed.  If any fail, check `ip addr show` on the relevant
+interface and verify OVS bridge state with `ovs-vsctl show` on the BF2.
 
 ---
 
-## 2. Master-side BF2 Relay
-
-Worker BF2s send control messages over 100G to tianjin BF2, which must
-relay them to master_monitor on the tianjin host via tmfifo.
-
-Install `socat` on tianjin BF2 and start the relay:
+## 2. Clone Repository (all hosts)
 
 ```bash
-ssh root@192.168.100.2 "
-  apt-get install -y socat 2>/dev/null || yum install -y socat 2>/dev/null
-  # Kill any old relay
-  pkill -f 'socat.*9100' 2>/dev/null || true
-  # Relay: BF2 port 9100 (100G fabric) → host port 9000 (tmfifo)
-  nohup socat TCP-LISTEN:9100,fork,reuseaddr TCP:192.168.100.1:9000 \
-    > /tmp/socat_relay.log 2>&1 &
-"
-sleep 1
-```
-
-**Verify:**
-```bash
-ssh root@192.168.100.2 "ss -tlnp | grep 9100"
-# Should show socat listening on :9100
-```
-
----
-
-## 3. Clone Repository (all hosts)
-
-```bash
-# On tianjin (this machine):
+# tianjin:
 cd ~ && git clone git@github.com:Maxorao/SmartNIC-Based-Heterogeneous-Cluster.git experiments 2>/dev/null || (cd ~/experiments && git pull)
 
-# On fujian and helong:
+# fujian + helong:
 for host in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "cd ~ && git clone git@github.com:Maxorao/SmartNIC-Based-Heterogeneous-Cluster.git experiments 2>/dev/null || (cd ~/experiments && git pull)"
 done
@@ -124,7 +131,7 @@ done
 
 ---
 
-## 4. Install Dependencies (all hosts)
+## 3. Install Dependencies (all hosts)
 
 ```bash
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
@@ -132,7 +139,8 @@ for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
     sudo apt-get update -qq &&
     sudo apt-get install -y -qq libopenblas-dev linux-tools-\$(uname -r) \
       sysstat stress-ng python3-pip sockperf 2>/dev/null &&
-    pip3 install -q numpy pandas
+    pip3 install -q numpy pandas &&
+    sudo sysctl -w kernel.perf_event_paranoid=1
   " &
 done
 wait
@@ -143,12 +151,11 @@ echo "All hosts done"
 ```bash
 dpkg -l libopenblas-dev | grep '^ii' && echo "OpenBLAS OK"
 which sockperf && echo "sockperf OK"
-sudo sysctl -w kernel.perf_event_paranoid=1   # enable perf for non-root
 ```
 
 ---
 
-## 5. Compile: Host-side (all hosts)
+## 4. Compile: Host-side (all hosts)
 
 ```bash
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
@@ -182,10 +189,9 @@ done
 
 ---
 
-## 6. Compile: BF2-side (all BF2s)
+## 5. Compile: BF2-side (all BF2s)
 
 ```bash
-# Push sources and compile on each BF2
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
     BF=192.168.100.2
@@ -217,22 +223,19 @@ done
 
 ---
 
-## 7. Experiment A — Communication Path Latency
+## 6. Experiment A — Communication Path Latency
 
-Measures one-way latency (RTT/2) across five communication paths.
+Measures RTT/2 (one-way latency) across five communication paths.
+Sizes: 64B, 256B, 1024B.  10000 iterations each.
 
 ### Path ① Comch host↔BF2 (PCIe kernel-bypass)
 
-Already measured: ~29 µs.  Re-run on fujian for fresh data:
-
 ```bash
-# On fujian — start BF2 echo server:
 ssh $(whoami)@172.28.4.77 "
   ssh root@192.168.100.2 'pkill bench_nic 2>/dev/null; sleep 1
     nohup ~/experiments/bench/latency_bench/bench_nic --pci=03:00.0 --mode=comch \
     > /tmp/bench_nic.log 2>&1 &'
   sleep 3
-  # Run from host:
   sudo ~/experiments/bench/latency_bench/bench_host \
     --pci=0000:5e:00.0 --mode=comch --iters=10000 \
     --output-dir=~/exp_data/A 2>&1
@@ -255,44 +258,40 @@ ssh $(whoami)@172.28.4.77 "
 "
 ```
 
-### Path ③ TCP LAN host→host (eno1, baseline for direct control plane)
-
-Uses sockperf for precise measurement:
+### Path ③ TCP LAN host→host (eno1, 1G management)
 
 ```bash
-# Start sockperf server on tianjin:
+# Server on tianjin:
 sockperf sr --tcp --port 11111 &
-SOCKPERF_PID=$!
-sleep 1
+SPID=$!; sleep 1
 
-# Run from fujian:
+# Client from fujian:
 ssh $(whoami)@172.28.4.77 "
+  mkdir -p ~/exp_data/A
   for size in 64 256 1024; do
-    echo '--- TCP LAN \${size}B ---'
+    echo \"--- TCP LAN (eno1) \${size}B ---\"
     sockperf pp --tcp -i 172.28.4.75 --port 11111 \
-      -m \${size} -t 10 --full-rtt \
-      2>&1 | tee ~/exp_data/A/tcp_lan_\${size}B.txt
+      -m \${size} -t 10 --full-rtt 2>&1 | tee ~/exp_data/A/tcp_lan_\${size}B.txt
   done
 "
-
-kill $SOCKPERF_PID 2>/dev/null
+kill $SPID 2>/dev/null
 ```
 
-### Path ④ TCP 100G BF2→BF2 (offloaded control-plane fabric)
+### Path ④ TCP 100G BF2→BF2 (ARM-to-ARM via fabric)
 
 ```bash
-# Start sockperf server on tianjin BF2:
+# Server on tianjin BF2:
 ssh root@192.168.100.2 "
   pkill sockperf 2>/dev/null
-  apt-get install -y sockperf 2>/dev/null || true
+  which sockperf || apt-get install -y sockperf 2>/dev/null
   nohup sockperf sr --tcp --port 11111 > /tmp/sockperf.log 2>&1 &
 "
 sleep 2
 
-# Run from fujian BF2:
+# Client from fujian BF2:
 ssh $(whoami)@172.28.4.77 "
   ssh root@192.168.100.2 '
-    apt-get install -y sockperf 2>/dev/null || true
+    which sockperf || apt-get install -y sockperf 2>/dev/null
     for size in 64 256 1024; do
       echo \"--- BF2-BF2 100G \${size}B ---\"
       sockperf pp --tcp -i 192.168.56.2 --port 11111 \
@@ -301,105 +300,126 @@ ssh $(whoami)@172.28.4.77 "
   '
 " | tee ~/exp_data/A/tcp_bf2_100g.txt
 
-# Cleanup
 ssh root@192.168.100.2 "pkill sockperf"
 ```
 
-### Path ⑤ End-to-end offload path (BF2→100G→BF2→tmfifo→host)
+### Path ⑤ TCP 100G host→host (E2E via BF2 OVS, no relay)
 
-This tests the complete offloaded control-plane path latency.
-Use the socat relay (port 9100 on tianjin BF2 → port 9000 on tianjin host).
+This is the actual end-to-end path for both offloaded and non-offloaded
+control-plane traffic.  Packets go: host → PCIe → BF2 OVS → physical
+port → 100G switch → physical port → BF2 OVS → PCIe → host.
 
 ```bash
-# Start a simple echo server on tianjin host port 9000:
-# (or use sockperf server)
-sockperf sr --tcp --port 9000 &
-ECHO_PID=$!
-sleep 1
+# Server on tianjin (bind to 100G interface):
+sockperf sr --tcp --port 11111 --bind 192.168.56.10 &
+SPID=$!; sleep 1
 
-# From fujian BF2, connect through 100G → tianjin BF2 relay → tianjin host:
+# Client from helong (via 100G):
+ssh $(whoami)@172.28.4.85 "
+  mkdir -p ~/exp_data/A
+  for size in 64 256 1024; do
+    echo \"--- 100G host-host (OVS) \${size}B ---\"
+    sockperf pp --tcp -i 192.168.56.10 --port 11111 \
+      -m \${size} -t 10 --full-rtt 2>&1 | tee ~/exp_data/A/tcp_100g_host_\${size}B.txt
+  done
+"
+kill $SPID 2>/dev/null
+
+# Also test from fujian:
+sockperf sr --tcp --port 11111 --bind 192.168.56.10 &
+SPID=$!; sleep 1
 ssh $(whoami)@172.28.4.77 "
-  ssh root@192.168.100.2 '
-    for size in 64 256 1024; do
-      echo \"--- E2E offload \${size}B ---\"
-      sockperf pp --tcp -i 192.168.56.2 --port 9100 \
-        -m \${size} -t 10 --full-rtt
-    done
-  '
-" | tee ~/exp_data/A/tcp_e2e_offload.txt
-
-kill $ECHO_PID 2>/dev/null
+  mkdir -p ~/exp_data/A
+  for size in 64 256 1024; do
+    echo \"--- 100G host-host fujian (OVS) \${size}B ---\"
+    sockperf pp --tcp -i 192.168.56.10 --port 11111 \
+      -m \${size} -t 10 --full-rtt 2>&1 | tee ~/exp_data/A/tcp_100g_host_fujian_\${size}B.txt
+  done
+"
+kill $SPID 2>/dev/null
 ```
 
 ### Collect results
 
+Gather all output files and paste the summary here.
+
 ```bash
-echo "=== Experiment A Summary ===" | tee ~/exp_data/A/summary.txt
-echo "" >> ~/exp_data/A/summary.txt
-echo "Path ①②: see bench_host output in ~/exp_data/A/" >> ~/exp_data/A/summary.txt
-echo "Path ③④⑤: see sockperf output files" >> ~/exp_data/A/summary.txt
-cat ~/exp_data/A/tcp_lan_*.txt ~/exp_data/A/tcp_bf2_100g.txt ~/exp_data/A/tcp_e2e_offload.txt \
-  >> ~/exp_data/A/summary.txt 2>/dev/null
+echo "=== Experiment A Summary ==="
+echo "Path ①②: see bench_host CSV files"
+echo "Path ③④⑤: see sockperf output below"
+echo ""
+for f in ~/exp_data/A/tcp_*.txt; do
+  [ -f "$f" ] && echo "--- $(basename $f) ---" && grep -E "(avg-latency|percentile)" "$f"
+done
 ```
 
 **Data to collect**: paste the full summary here.
 
 ---
 
-## 8. Experiment B — Interference Elimination
+## 7. Experiment B — Interference Elimination
 
-This is the core experiment.  Measures GEMM throughput on a worker host
-(fujian) under three control-plane configurations.
+Core experiment.  Measures GEMM throughput on fujian under three
+control-plane configurations.  All control-plane traffic flows over
+the 100G fabric (192.168.56.0/24).
 
 ### Architecture
 
 ```
-Scenario 2 (no offload):
-  fujian host: GEMM + N×slave_monitor → Comch → BF2 → TCP 100G → tianjin BF2 → relay → master
-  (slave_monitor does: read /proc + build protocol msg + manage heartbeat + Comch send)
+Scenario 1 (baseline):
+  fujian host: GEMM alone (16 threads, NUMA node 0)
 
-Scenario 3 (offloaded):
-  fujian host: GEMM + N×metric_push → Comch → BF2 (forward_routine) → TCP 100G → tianjin BF2 → relay → master
-  (metric_push does: read /proc + Comch send raw report — no protocol logic)
+Scenario 2 (no offload — control plane on host):
+  fujian host: GEMM + 8× slave_monitor --mode=direct → TCP 192.168.56.10:9000
+  (each slave_monitor: read /proc + build msg + TCP send through enp94s0f1np1)
+  Host CPU handles all control-plane work.
+
+Scenario 3 (offloaded — control plane on BF2):
+  fujian host: GEMM + 1× metric_push → Comch → BF2
+  fujian BF2:  forward_routine → TCP 192.168.56.10:9000
+  (metric_push: read /proc + Comch DMA, 1.25ms interval = 800 reports/s)
+  Host CPU only does minimal /proc reads + PCIe DMA.  BF2 ARM handles TCP.
 ```
+
+**Why N=8 for scenario 2 but N=1 for scenario 3?**  DOCA Comch supports only
+one client connection per service name.  To keep total report rate equal
+(800 reports/s), scenario 3 runs one metric_push at 1.25ms interval instead
+of 8 at 10ms.  This is a realistic offload design — a single multiplexed
+Comch channel replaces multiple TCP connections.
 
 ### Parameters
 
-- **GEMM**: 16 threads on NUMA node 0 (16 physical cores, ~100% CPU)
-- **N_MONITORS**: 8 instances (simulates kubelet + metrics + logging + health)
-- **Interval**: 10 ms per instance (100 reports/s each, 800 total)
+- **GEMM**: OPENBLAS_NUM_THREADS=16, numactl --cpunodebind=0 (100% CPU, socket 0)
+- **Scenario 2**: 8 × slave_monitor at 10ms interval = 800 reports/s total
+- **Scenario 3**: 1 × metric_push at 1ms interval = 1000 reports/s (≥ scenario 2 rate)
 - **Duration**: 60 seconds per scenario
 
-### Setup (run once before starting scenarios)
+### Setup
 
 ```bash
 source ~/experiments/scripts/config.sh
+mkdir -p ~/exp_data/B
 
-# 1. Start master_monitor on tianjin host
+# Start master_monitor on tianjin host (listens on all interfaces)
 "${MASTER_MONITOR}" --port="${MASTER_PORT}" \
   > ~/exp_data/B/master.log 2>&1 &
 MASTER_PID=$!
 sleep 2
+echo "master_monitor started (PID=${MASTER_PID})"
 
-# 2. Ensure socat relay on tianjin BF2 (from step 2)
-ssh root@192.168.100.2 "ss -tlnp | grep 9100 || (
-  nohup socat TCP-LISTEN:9100,fork,reuseaddr TCP:192.168.100.1:9000 \
-    > /tmp/socat_relay.log 2>&1 &
-)"
-
-# 3. Start forward_routine on fujian BF2
+# Start forward_routine on fujian BF2 (for scenario 3)
 ssh $(whoami)@172.28.4.77 "
   ssh root@192.168.100.2 '
     pkill -f forward_routine 2>/dev/null; sleep 1
     nohup ~/experiments/control-plane/forwarder/forward_routine \
       --pci=03:00.0 \
-      --master-ip=192.168.56.2 \
-      --master-port=9100 \
+      --master-ip=192.168.56.10 \
+      --master-port=9000 \
       > /tmp/forward_routine.log 2>&1 &
   '
 "
 sleep 3
-echo "Setup complete. master_PID=${MASTER_PID}"
+echo "forward_routine started on fujian BF2"
 ```
 
 ### Scenario 1: Baseline (GEMM only)
@@ -408,138 +428,120 @@ echo "Setup complete. master_PID=${MASTER_PID}"
 ssh $(whoami)@172.28.4.77 "
   source ~/experiments/scripts/config.sh
   mkdir -p ~/exp_data/B
-
   echo '=== Scenario 1: GEMM baseline ==='
 
-  # Run GEMM on NUMA node 0
   numactl --cpunodebind=0 --membind=0 \
-    env OPENBLAS_NUM_THREADS=${GEMM_THREADS} \
-    ~/experiments/bench/gemm_bench/gemm_bench --duration=${GEMM_DURATION} \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
     > ~/exp_data/B/scenario1_gflops.txt 2>/dev/null &
-  GEMM_PID=\$!
-  sleep 1
+  GPID=\$!; sleep 1
 
-  # Attach perf stat
-  sudo perf stat -p \${GEMM_PID} \
+  sudo perf stat -p \${GPID} \
     -e LLC-load-misses,LLC-loads,context-switches,instructions \
     -I 1000 -o ~/exp_data/B/scenario1_perf.txt \
-    sleep ${GEMM_DURATION} &
+    sleep 60 &
 
-  wait \${GEMM_PID}
-  sleep 2
+  wait \${GPID}; sleep 2
   echo 'Scenario 1 done'
-  head -3 ~/exp_data/B/scenario1_gflops.txt
+  tail -5 ~/exp_data/B/scenario1_gflops.txt
 "
 ```
 
-### Scenario 2: No offload (GEMM + N×slave_monitor on host)
+### Scenario 2: No offload (slave_monitor on host, TCP to master)
 
-slave_monitor runs on fujian host, Comch-sends to BF2, BF2 forwards to master via 100G.
+Each slave_monitor sends TCP directly through the host's 100G NIC
+(enp94s0f1np1) to master_monitor on tianjin.  The host CPU handles
+all protocol building and network I/O.
 
 ```bash
 ssh $(whoami)@172.28.4.77 "
   source ~/experiments/scripts/config.sh
+  echo '=== Scenario 2: GEMM + 8x slave_monitor (no offload) ==='
 
-  echo '=== Scenario 2: GEMM + ${N_MONITORS}x slave_monitor (no offload) ==='
-
-  # Start N slave_monitor instances on NUMA node 0
-  SLAVE_PIDS=()
-  for i in \$(seq 1 ${N_MONITORS}); do
+  # Start 8 slave_monitors in direct TCP mode on NUMA node 0
+  PIDS=()
+  for i in \$(seq 1 8); do
     numactl --cpunodebind=0 \
-      sudo ~/experiments/control-plane/slave/slave_monitor \
-        --mode=offload \
-        --pci=${HOST_PCI} \
-        --interval=${HIGH_LOAD_INTERVAL} \
+      ~/experiments/control-plane/slave/slave_monitor \
+        --mode=direct \
+        --master-ip=192.168.56.10 \
+        --master-port=9000 \
+        --interval=10 \
         --node-id=\"slave-\${i}-\$(hostname)\" \
       > ~/exp_data/B/scenario2_slave_\${i}.log 2>&1 &
-    SLAVE_PIDS+=(\$!)
+    PIDS+=(\$!)
   done
   sleep 3
 
-  # Start GEMM on same NUMA node
   numactl --cpunodebind=0 --membind=0 \
-    env OPENBLAS_NUM_THREADS=${GEMM_THREADS} \
-    ~/experiments/bench/gemm_bench/gemm_bench --duration=${GEMM_DURATION} \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
     > ~/exp_data/B/scenario2_gflops.txt 2>/dev/null &
-  GEMM_PID=\$!
-  sleep 1
+  GPID=\$!; sleep 1
 
-  sudo perf stat -p \${GEMM_PID} \
+  sudo perf stat -p \${GPID} \
     -e LLC-load-misses,LLC-loads,context-switches,instructions \
     -I 1000 -o ~/exp_data/B/scenario2_perf.txt \
-    sleep ${GEMM_DURATION} &
+    sleep 60 &
 
-  wait \${GEMM_PID}
+  wait \${GPID}
 
-  # Stop slave_monitors
-  for pid in \${SLAVE_PIDS[@]}; do
-    sudo kill \${pid} 2>/dev/null
-  done
+  for pid in \${PIDS[@]}; do kill \${pid} 2>/dev/null; done
   sleep 5
   echo 'Scenario 2 done'
-  head -3 ~/exp_data/B/scenario2_gflops.txt
+  tail -5 ~/exp_data/B/scenario2_gflops.txt
 "
 ```
 
-### Scenario 3: Offloaded (GEMM + N×metric_push on host)
+### Scenario 3: Offloaded (metric_push on host, forward_routine on BF2)
 
-metric_push is the lightweight shim — just reads /proc and Comch-sends
-raw data.  All protocol logic runs on the BF2.
+Only a single lightweight metric_push runs on the host.  It reads /proc
+and Comch-sends raw data to the BF2 every 1ms.  The BF2 forward_routine
+handles TCP to master.
 
 ```bash
 ssh $(whoami)@172.28.4.77 "
   source ~/experiments/scripts/config.sh
+  echo '=== Scenario 3: GEMM + metric_push (offloaded to BF2) ==='
 
-  echo '=== Scenario 3: GEMM + ${N_MONITORS}x metric_push (offloaded) ==='
-
-  # Start N metric_push instances on NUMA node 0
-  PUSH_PIDS=()
-  for i in \$(seq 1 ${N_MONITORS}); do
-    numactl --cpunodebind=0 \
-      sudo ~/experiments/bench/metric_push/metric_push \
-        --pci=${HOST_PCI} \
-        --interval=${HIGH_LOAD_INTERVAL} \
-        --node-id=\"push-\${i}-\$(hostname)\" \
-      > ~/exp_data/B/scenario3_push_\${i}.log 2>&1 &
-    PUSH_PIDS+=(\$!)
-  done
+  # Start 1 metric_push on NUMA node 0 (1ms interval = 1000 reports/s)
+  numactl --cpunodebind=0 \
+    sudo ~/experiments/bench/metric_push/metric_push \
+      --pci=0000:5e:00.0 \
+      --interval=1 \
+      --node-id=\"push-\$(hostname)\" \
+    > ~/exp_data/B/scenario3_push.log 2>&1 &
+  PUSH_PID=\$!
   sleep 3
 
-  # Start GEMM on same NUMA node
   numactl --cpunodebind=0 --membind=0 \
-    env OPENBLAS_NUM_THREADS=${GEMM_THREADS} \
-    ~/experiments/bench/gemm_bench/gemm_bench --duration=${GEMM_DURATION} \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
     > ~/exp_data/B/scenario3_gflops.txt 2>/dev/null &
-  GEMM_PID=\$!
-  sleep 1
+  GPID=\$!; sleep 1
 
-  sudo perf stat -p \${GEMM_PID} \
+  sudo perf stat -p \${GPID} \
     -e LLC-load-misses,LLC-loads,context-switches,instructions \
     -I 1000 -o ~/exp_data/B/scenario3_perf.txt \
-    sleep ${GEMM_DURATION} &
+    sleep 60 &
 
-  wait \${GEMM_PID}
+  wait \${GPID}
 
-  # Stop metric_push instances
-  for pid in \${PUSH_PIDS[@]}; do
-    sudo kill \${pid} 2>/dev/null
-  done
+  sudo kill \${PUSH_PID} 2>/dev/null
   sleep 5
   echo 'Scenario 3 done'
-  head -3 ~/exp_data/B/scenario3_gflops.txt
+  tail -5 ~/exp_data/B/scenario3_gflops.txt
 "
 ```
 
 ### Cleanup and collect
 
 ```bash
-# Stop master_monitor
+# Stop services
 kill ${MASTER_PID} 2>/dev/null
-
-# Stop forward_routine on fujian BF2
 ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'pkill -f forward_routine'"
 
-# Fetch results from fujian
+# Fetch results
 scp $(whoami)@172.28.4.77:~/exp_data/B/scenario*_gflops.txt ~/exp_data/B/
 scp $(whoami)@172.28.4.77:~/exp_data/B/scenario*_perf.txt ~/exp_data/B/
 
@@ -552,32 +554,25 @@ for s in 1 2 3; do
     echo "  Scenario ${s}: avg GFLOPS = ${avg}"
   fi
 done
-
-# Run analysis
-python3 ~/experiments/scripts/analyze/analyze_B.py
 ```
 
-**Data to collect**: paste the full summary, including per-scenario GFLOPS,
-LLC miss rates, context-switch counts, interference%, and recovery%.
+**Data to collect**: paste the full summary including GFLOPS, LLC miss rates,
+context-switch counts, interference%, and recovery%.
 
 ### Reproducibility (optional)
 
-Repeat Experiment B on helong (172.28.4.85) to confirm results on a
-second machine.  Use the same commands, replacing `172.28.4.77` with
-`172.28.4.85` and adjusting the BF2 fabric IP from `192.168.56.3` to
-`192.168.56.1`.
+Repeat on helong (172.28.4.85).  Replace `172.28.4.77` with `172.28.4.85`,
+`enp94s0f1np1` with `enp94s0f0np0`, and `192.168.56.11` with `192.168.56.12`.
 
 ---
 
-## 9. Experiment C — Scalability (deferred)
+## 8. Experiment C — Scalability (deferred)
 
-This experiment tests master_monitor scalability with increasing node count.
-It will be designed after Chapter 2 experiments are validated.  Placeholder:
+Will be designed after Chapter 2 experiments are validated.
 
 - Master: tianjin host
-- Real workers: fujian BF2 + helong BF2 (2 real)
-- Mock workers: Docker containers on fujian + helong
-- Scale: 2, 8, 32, 128 total nodes
+- Real workers: fujian + helong (2 real nodes)
+- Mock workers: Docker containers for scale (8, 32, 128 total)
 
 ---
 
@@ -585,51 +580,16 @@ It will be designed after Chapter 2 experiments are validated.  Placeholder:
 
 | Symptom | Fix |
 |---------|-----|
-| `socat: command not found` on BF2 | `apt-get install -y socat` or `yum install -y socat` |
-| BF2 ping 192.168.56.x fails | Check `ip addr show p1` on BF2; verify switch link is UP |
-| `doca_devinfo_create_list failed` | `sudo mlnx_bf_configure` or rescan: `echo 1 > /sys/bus/pci/rescan` |
-| Comch connect timeout | Check `ssh root@192.168.100.2 cat /tmp/forward_routine.log` |
-| `libdoca_comch not found` | `make info` in `tunnel/host/` to check installed libs |
+| `enp94s0f1np1: No such device` | Check `ip link show`; the interface may be named differently. Use `ls /sys/class/net/ \| grep enp` |
+| Ping 192.168.56.x fails between host and BF2 | Check OVS bridge: `ssh root@192.168.100.2 "ovs-vsctl show"`. Ensure p1 and pf1hpf are in the same bridge. |
+| BF2-to-BF2 ping fails | Check `ip addr show p1` on both BF2s; verify 100G switch link: `ethtool p1 \| grep Link` |
+| `doca_devinfo_create_list failed` | `sudo mlnx_bf_configure` or `echo 1 > /sys/bus/pci/rescan` |
+| Comch connect timeout | Check BF2 log: `ssh root@192.168.100.2 cat /tmp/forward_routine.log` |
+| `libdoca_comch not found` | Run `make info` in `tunnel/host/` |
 | perf permission denied | `sudo sysctl -w kernel.perf_event_paranoid=1` |
 | `gemm_bench: CBLAS error` | `sudo apt-get install -y libopenblas-dev` |
-| Multiple Comch instances fail | Only ONE Comch client can connect per BF2 at a time.  For N monitors, they must share a single Comch connection (see note below). |
-
-### Important: Comch single-connection limitation
-
-DOCA Comch supports **one client connection per service name**.  If you need
-N slave_monitor instances, they cannot each open their own Comch connection.
-
-**Workaround options for N>1 monitors:**
-1. Run all N instances in **direct TCP mode** (`--mode=direct`) connecting to
-   forward_routine via a local TCP port, and have ONE forward_routine handle
-   the Comch tunnel.
-2. Use different service names for each instance (requires code changes).
-3. Run a single slave_monitor/metric_push that internally does N× the work
-   (higher frequency or multiple /proc reads per cycle).
-
-**Recommended for Experiment B:** Use option 1.  Start forward_routine on
-the **host** listening on a local TCP port, and have N slave_monitors connect
-to it via localhost TCP.  forward_routine handles the single Comch channel
-to the BF2.
-
-If this limitation is encountered, adapt the experiment script as follows:
-
-```bash
-# On fujian host: start forward_routine as local TCP-to-Comch proxy
-sudo ~/experiments/control-plane/forwarder/forward_routine \
-  --pci=0000:5e:00.0 --listen-port=8888 > /tmp/fwd_host.log 2>&1 &
-
-# N slave_monitors connect to localhost:8888 (TCP, not Comch)
-for i in $(seq 1 $N_MONITORS); do
-  numactl --cpunodebind=0 \
-    ~/experiments/control-plane/slave/slave_monitor \
-      --mode=direct --master-ip=127.0.0.1 --master-port=8888 \
-      --interval=${HIGH_LOAD_INTERVAL} --node-id="slave-${i}" &
-done
-```
-
-This preserves the measurement: slave_monitor still runs on the host CPU,
-and the BF2 path is still used for inter-node communication.
+| Multiple slave_monitors fail with Comch | Comch supports 1 client per service name. Scenario 2 uses `--mode=direct` (TCP) to avoid this. Scenario 3 uses 1 metric_push instance. |
+| sockperf not found on BF2 | `apt-get install -y sockperf` or build from source |
 
 ---
 

@@ -33,12 +33,18 @@ HELONG_BF2_FABRIC="192.168.56.1"    # p0
 BF_IP="192.168.100.2"
 
 # ---------------------------------------------------------------
+# Host-side 100G IPs (on enp94s0f* interfaces, same 56.x subnet)
+# ---------------------------------------------------------------
+TIANJIN_100G="192.168.56.10"    # enp94s0f1np1
+FUJIAN_100G="192.168.56.11"     # enp94s0f1np1
+HELONG_100G="192.168.56.12"     # enp94s0f0np0
+
+# ---------------------------------------------------------------
 # Master configuration
 # ---------------------------------------------------------------
 MASTER_HOST="${TIANJIN_IP}"
+MASTER_100G="${TIANJIN_100G}"   # master reachable via 100G fabric
 MASTER_PORT="9000"
-# Port on tianjin BF2 that relays to master_monitor via tmfifo
-MASTER_BF2_RELAY_PORT="9100"
 
 # ---------------------------------------------------------------
 # PCI addresses (same across all three hosts)
