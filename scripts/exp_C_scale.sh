@@ -52,8 +52,10 @@ cleanup_all() {
     for w in "${WORKERS[@]}"; do
         ${SSH} ${SSH_USER}@${w} "pkill -f mock_slave 2>/dev/null" || true
     done
-    # Kill master_monitor locally
+    # Kill master_monitor locally (SIGTERM, then SIGKILL if still alive)
     pkill -f master_monitor 2>/dev/null || true
+    sleep 1
+    pkill -9 -f master_monitor 2>/dev/null || true
     sleep 2
 }
 
@@ -71,7 +73,15 @@ for N in "${NODE_COUNTS[@]}"; do
         > "${DATA_DIR}/C/master_${N}nodes.log" 2>&1 &
     MPID=$!
     sleep 2
-    echo "  master_monitor PID=${MPID}"
+
+    # Verify master_monitor is actually running
+    if ! kill -0 ${MPID} 2>/dev/null; then
+        echo "  ERROR: master_monitor failed to start! Log:"
+        cat "${DATA_DIR}/C/master_${N}nodes.log"
+        echo "  Skipping N=${N}"
+        continue
+    fi
+    echo "  master_monitor PID=${MPID} (verified alive)"
 
     # Split N across 2 workers
     N_PER_WORKER=$(( N / 2 ))
@@ -79,6 +89,7 @@ for N in "${NODE_COUNTS[@]}"; do
 
     # Launch mock_slave on each worker
     WORKER_IDX=0
+    MOCK_PIDS=()
     for w in "${WORKERS[@]}"; do
         THIS_N=${N_PER_WORKER}
         # Give remainder to first worker
@@ -95,6 +106,7 @@ for N in "${NODE_COUNTS[@]}"; do
                 --interval=${REPORT_INTERVAL} \
                 --duration=${TOTAL_DURATION}
         " > "${DATA_DIR}/C/mock_${N}nodes_${w}.txt" 2>&1 &
+        MOCK_PIDS+=($!)
 
         WORKER_IDX=$(( WORKER_IDX + 1 ))
     done
@@ -108,9 +120,11 @@ for N in "${NODE_COUNTS[@]}"; do
     pidstat -p ${MPID} -u -r 1 ${MEASURE} \
         > "${DATA_DIR}/C/pidstat_${N}nodes.txt" 2>&1 || true
 
-    # Wait for mock_slaves to finish
+    # Wait for mock_slave SSH processes only (not master_monitor)
     echo "  Waiting for mock_slaves to exit..."
-    wait 2>/dev/null || true
+    for pid in "${MOCK_PIDS[@]}"; do
+        wait ${pid} 2>/dev/null || true
+    done
 
     # ── Extract quick stats ─────────────────────────────────────────────
     # CPU average from pidstat
@@ -123,18 +137,29 @@ for N in "${NODE_COUNTS[@]}"; do
               END{if(n>0) printf "%.1f", s/n/1024; else print "N/A"}' \
               "${DATA_DIR}/C/pidstat_${N}nodes.txt" 2>/dev/null || echo "N/A")
 
-    # Aggregate latency from mock_slave outputs
-    TOTAL_LINE=""
+    # Aggregate latency from mock_slave outputs across both workers
+    AGG_SENT=0; AGG_ACKED=0; AGG_ERRORS=0; AGG_LAT="N/A"
     for w in "${WORKERS[@]}"; do
         f="${DATA_DIR}/C/mock_${N}nodes_${w}.txt"
-        [ -f "$f" ] && TOTAL_LINE="${TOTAL_LINE}$(grep '^TOTAL:' "$f" 2>/dev/null || true) "
+        if [ -f "$f" ]; then
+            s=$(grep '^TOTAL:' "$f" 2>/dev/null | sed 's/.*sent=\([0-9]*\).*/\1/')
+            a=$(grep '^TOTAL:' "$f" 2>/dev/null | sed 's/.*acked=\([0-9]*\).*/\1/')
+            e=$(grep '^TOTAL:' "$f" 2>/dev/null | sed 's/.*errors=\([0-9]*\).*/\1/')
+            AGG_SENT=$(( AGG_SENT + ${s:-0} ))
+            AGG_ACKED=$(( AGG_ACKED + ${a:-0} ))
+            AGG_ERRORS=$(( AGG_ERRORS + ${e:-0} ))
+        fi
     done
+    # Average latency from all TOTAL lines
+    AGG_LAT=$(grep '^TOTAL:' "${DATA_DIR}"/C/mock_${N}nodes_*.txt 2>/dev/null \
+              | sed 's/.*avg_lat=\([0-9.]*\).*/\1/' \
+              | awk '{s+=$1; n++} END{if(n>0) printf "%.3f", s/n; else print "N/A"}')
 
     echo ""
     echo "  Results for ${N} nodes:"
     echo "    master CPU: ${AVG_CPU}%"
     echo "    master RSS: ${AVG_RSS} MB"
-    echo "    mock_slave: ${TOTAL_LINE}"
+    echo "    mock_slave: sent=${AGG_SENT}  acked=${AGG_ACKED}  errors=${AGG_ERRORS}  avg_lat=${AGG_LAT} ms"
     echo ""
 
     # Stop master_monitor

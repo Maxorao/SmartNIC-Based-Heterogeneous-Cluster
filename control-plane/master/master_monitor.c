@@ -208,6 +208,9 @@ static void *handle_connection(void *arg)
                 g_total_writes++;
                 pthread_mutex_unlock(&g_stats_lock);
             }
+
+            /* ACK the resource report so mock_slave can measure latency */
+            proto_tcp_send(fd, MSG_HEARTBEAT_ACK, hdr.seq, NULL, 0);
             break;
         }
 
@@ -416,8 +419,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    signal(SIGTERM, sigterm_handler);
-    signal(SIGINT,  sigterm_handler);
+    /* Use sigaction without SA_RESTART so accept() returns EINTR on signal */
+    struct sigaction sa = { .sa_handler = sigterm_handler, .sa_flags = 0 };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     master_log("starting on port %u (HTTP :%u)", g_port, g_http_port);

@@ -121,7 +121,6 @@ static void *node_thread(void *arg_ptr)
     {
         msg_header_t hdr;
         char payload[PROTO_MAX_PAYLOAD];
-        /* Non-blocking drain — ignore errors at registration */
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         proto_tcp_recv(fd, &hdr, payload, sizeof(payload));
@@ -280,16 +279,16 @@ int main(int argc, char *argv[])
 
     printf("\n=== mock_slave results (%d nodes) ===\n", g_nodes);
     printf("%-16s  %8s  %8s  %8s  %12s\n",
-           "node_id", "sent", "acked", "errors", "avg_lat_us");
+           "node_id", "sent", "acked", "errors", "avg_lat_ms");
 
     for (int i = 0; i < g_nodes && i < 20; i++) {  /* print first 20 */
         node_stats_t *s = &g_stats[i];
-        double avg_lat = s->msgs_acked > 0
-                         ? (double)s->latency_sum_us / (double)s->msgs_acked
+        double avg_lat_ms = s->msgs_acked > 0
+                         ? (double)s->latency_sum_us / (double)s->msgs_acked / 1000.0
                          : 0.0;
         printf("mock-node-%04d  %8" PRIu64 "  %8" PRIu64 "  %8" PRIu64
-               "  %12.1f\n",
-               i, s->msgs_sent, s->msgs_acked, s->send_errors, avg_lat);
+               "  %12.3f\n",
+               i, s->msgs_sent, s->msgs_acked, s->send_errors, avg_lat_ms);
         total_sent   += s->msgs_sent;
         total_acked  += s->msgs_acked;
         total_errors += s->send_errors;
@@ -313,12 +312,12 @@ int main(int argc, char *argv[])
         printf("... (%d more nodes not shown individually)\n", g_nodes - 20);
     }
 
-    double overall_avg_lat = lat_count > 0
-                             ? (double)total_lat / (double)lat_count
+    double overall_avg_lat_ms = lat_count > 0
+                             ? (double)total_lat / (double)lat_count / 1000.0
                              : 0.0;
     printf("\nTOTAL: sent=%" PRIu64 "  acked=%" PRIu64
-           "  errors=%" PRIu64 "  avg_lat=%.1f us\n",
-           total_sent, total_acked, total_errors, overall_avg_lat);
+           "  errors=%" PRIu64 "  avg_lat=%.3f ms\n",
+           total_sent, total_acked, total_errors, overall_avg_lat_ms);
 
     if (total_sent > 0) {
         printf("Error rate: %.2f%%\n",
