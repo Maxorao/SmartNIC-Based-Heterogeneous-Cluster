@@ -318,12 +318,24 @@ mkdir -p ~/exp_data/D
 
 # Start cluster_master on tianjin
 pkill -f cluster_master 2>/dev/null; sleep 1
-"${CLUSTER_MASTER}" --grpc-port=${GRPC_PORT} \
-  --db-connstr="${DB_CONNSTR}" \
+"${CLUSTER_MASTER}" --grpc-port ${GRPC_PORT} \
+  --db-connstr "${DB_CONNSTR}" \
   > ~/exp_data/D/cluster_master.log 2>&1 &
 MASTER_PID=$!
 sleep 3
 echo "cluster_master started (PID=${MASTER_PID})"
+
+# Start master_watchdog on tianjin BF2
+ssh root@192.168.100.2 "
+  pkill -f master_watchdog 2>/dev/null; sleep 1
+  nohup ~/experiments/build/control-plane/watchdog/master_watchdog \
+    --dev-pci=${NIC_PCI} \
+    --master-grpc-addr=192.168.100.1:${GRPC_PORT} \
+    --check-interval-ms=3000 \
+    > /tmp/master_watchdog.log 2>&1 &
+"
+sleep 2
+echo "master_watchdog started on tianjin BF2"
 
 # Start slave_agent on fujian BF2
 ssh $(whoami)@172.28.4.77 "
@@ -583,6 +595,7 @@ cat ~/exp_data/D/scenario3.csv
 
 ```bash
 pkill -f cluster_master 2>/dev/null
+ssh root@192.168.100.2 "pkill -f master_watchdog 2>/dev/null"
 for host in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
     pkill -f metric_push 2>/dev/null
@@ -611,6 +624,16 @@ pkill -f cluster_master 2>/dev/null; sleep 1
   --db-connstr="${DB_CONNSTR}" \
   > ~/exp_data/E/cluster_master.log 2>&1 &
 sleep 3
+
+# Start master_watchdog on tianjin BF2
+ssh root@192.168.100.2 "
+  pkill -f master_watchdog 2>/dev/null; sleep 1
+  nohup ~/experiments/build/control-plane/watchdog/master_watchdog \
+    --dev-pci=${NIC_PCI} \
+    --master-grpc-addr=192.168.100.1:${GRPC_PORT} \
+    > /tmp/master_watchdog.log 2>&1 &
+"
+sleep 2
 
 # Start slave_agents on both worker BF2s
 for host_ip in 172.28.4.77 172.28.4.85; do
@@ -757,6 +780,7 @@ psql -h localhost -U postgres -d cluster_metrics -c \
 
 ```bash
 pkill -f cluster_master 2>/dev/null
+ssh root@192.168.100.2 "pkill -f master_watchdog 2>/dev/null"
 for host_ip in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host_ip} "
     pkill -f metric_push 2>/dev/null
@@ -789,6 +813,16 @@ pkill -f cluster_master 2>/dev/null; sleep 1
   --db-connstr="${DB_CONNSTR}" \
   > ~/exp_data/F/cluster_master.log 2>&1 &
 sleep 3
+
+# Start master_watchdog on tianjin BF2
+ssh root@192.168.100.2 "
+  pkill -f master_watchdog 2>/dev/null; sleep 1
+  nohup ~/experiments/build/control-plane/watchdog/master_watchdog \
+    --dev-pci=${NIC_PCI} \
+    --master-grpc-addr=192.168.100.1:${GRPC_PORT} \
+    > /tmp/master_watchdog.log 2>&1 &
+"
+sleep 2
 
 # Start slave_agent on fujian BF2
 ssh $(whoami)@172.28.4.77 "
@@ -901,6 +935,7 @@ grep -i "fujian" ~/exp_data/F/cluster_master.log | tail -20 | tee ~/exp_data/F/r
 
 ```bash
 pkill -f cluster_master 2>/dev/null
+ssh root@192.168.100.2 "pkill -f master_watchdog 2>/dev/null"
 ssh $(whoami)@172.28.4.77 "
   pkill -f metric_push 2>/dev/null
   ssh root@192.168.100.2 'pkill -f slave_agent 2>/dev/null'
