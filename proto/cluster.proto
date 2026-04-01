@@ -1,0 +1,240 @@
+// Cluster management gRPC service definitions.
+// Used between BF2 slave_agent and cluster_master (over TCP/100G).
+// Host<->BF2 communication still uses raw binary protocol over Comch (PCIe).
+
+syntax = "proto3";
+package cluster;
+
+// ---------------------------------------------------------------------------
+// Service definitions
+// ---------------------------------------------------------------------------
+
+// Primary control-plane service: slave_agent (BF2) <-> cluster_master
+service ClusterControl {
+  // Long-lived bidirectional stream. slave_agent opens one stream after
+  // registration; sends heartbeats + metrics, receives ACKs + commands.
+  rpc NodeSession(stream NodeMessage) returns (stream MasterMessage);
+
+  // Unary RPC for metric_push fallback when Comch/BF2 is down.
+  // Host metric_push connects directly to master in degradation mode.
+  rpc DirectPush(DirectPushRequest) returns (DirectPushResponse);
+}
+
+// Health checking service for master_watchdog on master's BF2.
+service MasterHealth {
+  rpc Ping(HealthPingRequest) returns (HealthPingResponse);
+}
+
+// Failover trigger: standby BF2 listens for this from primary watchdog.
+service FailoverControl {
+  rpc TriggerFailover(FailoverRequest) returns (FailoverResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Envelope messages for the bidirectional NodeSession stream
+// ---------------------------------------------------------------------------
+
+message NodeMessage {
+  oneof payload {
+    RegisterRequest    register_req   = 1;
+    HeartbeatPing      heartbeat      = 2;
+    ResourceReport     resource_report = 3;
+    BF2MetricsReport   bf2_report     = 4;
+    StatusChangeNotice status_change  = 5;
+    DeregisterNotice   deregister     = 6;
+    CommandResult      cmd_result     = 7;
+  }
+}
+
+message MasterMessage {
+  oneof payload {
+    RegisterAck    register_ack   = 1;
+    HeartbeatAck   heartbeat_ack  = 2;
+    ReportAck      report_ack     = 3;
+    NodeCommand    command        = 4;
+    ClusterView    cluster_view   = 5;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  string node_uuid      = 1;   // BF2 hardware UUID (immutable identity)
+  string hostname       = 2;   // human-readable name (e.g. "fujian")
+  string host_hostname  = 3;   // x86 host identity
+  string pci_bus_id     = 4;   // BF2 PCIe bus address as seen from host
+  string ip_addr        = 5;   // BF2 management IP
+  string version        = 6;   // software version string
+  BF2Capabilities caps  = 7;   // hardware capabilities
+}
+
+message BF2Capabilities {
+  uint32 arm_cores       = 1;
+  uint32 mem_mb          = 2;
+  uint32 port_speed_gbps = 3;
+  string doca_version    = 4;
+}
+
+message RegisterAck {
+  bool   accepted            = 1;
+  string assigned_id         = 2;   // cluster-assigned node ID
+  uint32 heartbeat_interval_ms = 3;
+  uint32 report_interval_ms  = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+message HeartbeatPing {
+  uint64       seq          = 1;
+  uint64       timestamp_ns = 2;
+  DomainStatus host_status  = 3;
+  DomainStatus bf2_status   = 4;
+}
+
+message HeartbeatAck {
+  uint64 seq              = 1;
+  uint64 master_time_ns   = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Resource reports
+// ---------------------------------------------------------------------------
+
+// Host metrics (collected by metric_push on host, proxied by slave_agent)
+message ResourceReport {
+  string node_uuid      = 1;
+  uint64 timestamp_ns   = 2;
+  float  cpu_usage_pct  = 3;
+  uint64 mem_total_kb   = 4;
+  uint64 mem_avail_kb   = 5;
+  uint64 net_rx_bytes   = 6;
+  uint64 net_tx_bytes   = 7;
+  uint64 ctx_switches   = 8;
+}
+
+// BF2 metrics (collected locally by slave_agent on ARM)
+message BF2MetricsReport {
+  string node_uuid        = 1;
+  uint64 timestamp_ns     = 2;
+  float  arm_cpu_pct      = 3;
+  uint64 arm_mem_total_kb = 4;
+  uint64 arm_mem_avail_kb = 5;
+  float  temperature_c    = 6;
+  uint64 port_rx_bytes    = 7;
+  uint64 port_tx_bytes    = 8;
+  uint64 port_rx_drops    = 9;
+  uint32 ovs_flow_count   = 10;
+  float  comch_msg_rate   = 11;  // messages/sec from host
+  float  comch_avg_lat_us = 12;  // average Comch round-trip (us)
+}
+
+message ReportAck {
+  uint64 seq = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Domain status & state changes
+// ---------------------------------------------------------------------------
+
+enum DomainStatus {
+  DOMAIN_UNKNOWN     = 0;
+  DOMAIN_OK          = 1;
+  DOMAIN_DEGRADED    = 2;
+  DOMAIN_UNREACHABLE = 3;
+}
+
+message StatusChangeNotice {
+  string       domain     = 1;   // "host" or "bf2"
+  DomainStatus old_status = 2;
+  DomainStatus new_status = 3;
+  string       reason     = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Commands (master -> node)
+// ---------------------------------------------------------------------------
+
+message NodeCommand {
+  string command_id = 1;
+  string action     = 2;   // "query", "config", "restart", etc.
+  bytes  payload    = 3;
+}
+
+message CommandResult {
+  string command_id = 1;
+  int32  exit_code  = 2;
+  bytes  output     = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster view (periodically pushed by master in the stream)
+// ---------------------------------------------------------------------------
+
+message ClusterView {
+  uint32 total_nodes  = 1;
+  uint32 online_nodes = 2;
+  uint32 suspect_nodes = 3;
+  uint32 offline_nodes = 4;
+  uint64 master_time_ns = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Deregistration
+// ---------------------------------------------------------------------------
+
+message DeregisterNotice {
+  string node_uuid = 1;
+  string reason    = 2;
+}
+
+// ---------------------------------------------------------------------------
+// DirectPush (metric_push fallback when BF2/Comch is down)
+// ---------------------------------------------------------------------------
+
+message DirectPushRequest {
+  string node_id       = 1;   // hostname of the x86 host
+  uint64 timestamp_ns  = 2;
+  float  cpu_usage_pct = 3;
+  uint64 mem_total_kb  = 4;
+  uint64 mem_avail_kb  = 5;
+  uint64 net_rx_bytes  = 6;
+  uint64 net_tx_bytes  = 7;
+}
+
+message DirectPushResponse {
+  bool accepted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Health checking (master_watchdog -> cluster_master)
+// ---------------------------------------------------------------------------
+
+message HealthPingRequest {
+  uint64 timestamp_ns = 1;
+}
+
+message HealthPingResponse {
+  uint64 timestamp_ns = 1;
+  bool   healthy      = 2;
+  uint32 node_count   = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Failover (primary watchdog -> standby BF2)
+// ---------------------------------------------------------------------------
+
+message FailoverRequest {
+  string primary_uuid   = 1;
+  string reason         = 2;
+  uint64 last_db_lsn    = 3;   // PostgreSQL WAL LSN for sync check
+  uint64 timestamp_ns   = 4;
+}
+
+message FailoverResponse {
+  bool   accepted       = 1;
+  string new_master_addr = 2;
+}

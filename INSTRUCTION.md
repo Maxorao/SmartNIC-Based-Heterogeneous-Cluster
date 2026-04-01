@@ -223,6 +223,87 @@ done
 
 ---
 
+## 5a. Install gRPC++ Dependencies (all hosts + BF2s)
+
+Required for the Chapter 3 v2 gRPC-based architecture.
+
+```bash
+# On all x86 hosts:
+for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    sudo apt-get install -y -qq cmake libgrpc++-dev libprotobuf-dev \
+      protobuf-compiler-grpc libpq-dev 2>/dev/null &&
+    echo '${host}: gRPC deps OK'
+  " &
+done
+wait
+
+# On all BF2 ARMs:
+for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    ssh root@192.168.100.2 '
+      apt-get update -qq &&
+      apt-get install -y -qq cmake libgrpc++-dev libprotobuf-dev \
+        protobuf-compiler-grpc 2>/dev/null &&
+      echo BF2_GRPC_DEPS_OK
+    '
+  " &
+done
+wait
+```
+
+**Verify:**
+```bash
+pkg-config --modversion grpc++ && echo "Host gRPC OK"
+ssh root@192.168.100.2 "pkg-config --modversion grpc++ && echo 'BF2 gRPC OK'"
+```
+
+---
+
+## 5b. Compile: gRPC Components (CMake build)
+
+```bash
+# On tianjin (master — builds cluster_master, mock_slave_grpc, metric_push_v2):
+cd ~/experiments
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+echo "Master build done"
+
+# On fujian + helong (workers — only need metric_push_v2):
+for host in 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    cd ~/experiments &&
+    cmake -B build -DCMAKE_BUILD_TYPE=Release &&
+    cmake --build build --target metric_push_v2 -j\$(nproc) &&
+    echo 'Worker build OK'
+  " &
+done
+wait
+
+# On all BF2 ARMs (builds slave_agent, master_watchdog):
+for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    ssh root@192.168.100.2 '
+      cd ~/experiments &&
+      cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOMCH_NIC_DOCA_VER=15 &&
+      cmake --build build --target slave_agent master_watchdog -j\$(nproc) &&
+      echo BF2_BUILD_V2_OK
+    '
+  " &
+done
+wait
+```
+
+**Verify:**
+```bash
+source ~/experiments/scripts/config.sh
+ls "${CLUSTER_MASTER}" "${MOCK_SLAVE_GRPC}" && echo "Master binaries OK"
+ssh $(whoami)@172.28.4.77 "ls ~/experiments/build/bench/metric_push/metric_push_v2 && echo 'Worker binary OK'"
+ssh root@192.168.100.2 "ls ~/experiments/build/control-plane/slave/slave_agent && echo 'BF2 binary OK'"
+```
+
+---
+
 ## 6. Experiment D — Fault Recovery (Chapter 3)
 
 This experiment measures the system's fault detection and recovery time

@@ -107,3 +107,45 @@ SCALE_DURATION=30
 # DB connection (optional — for master_monitor persistence)
 # ---------------------------------------------------------------
 DB_CONNSTR="host=localhost dbname=cluster_metrics user=postgres password=postgres"
+
+# ===============================================================
+# Chapter 3 v2: gRPC-based architecture
+# ===============================================================
+
+# ---------------------------------------------------------------
+# gRPC configuration
+# ---------------------------------------------------------------
+GRPC_PORT="50051"
+HTTP_STATUS_PORT="8080"
+
+# ---------------------------------------------------------------
+# New binary paths (CMake build output)
+# ---------------------------------------------------------------
+BUILD_DIR="${EXP_BASE}/build"
+
+CLUSTER_MASTER="${BUILD_DIR}/control-plane/master/cluster_master"
+SLAVE_AGENT="${BUILD_DIR}/control-plane/slave/slave_agent"
+MASTER_WATCHDOG="${BUILD_DIR}/control-plane/watchdog/master_watchdog"
+METRIC_PUSH_V2="${BUILD_DIR}/bench/metric_push/metric_push_v2"
+MOCK_SLAVE_GRPC="${BUILD_DIR}/bench/mock_slave/mock_slave_grpc"
+
+# Remote binary paths on BF2 ARM (Chapter 3 v2)
+NIC_SLAVE_AGENT="/root/experiments/build/control-plane/slave/slave_agent"
+NIC_MASTER_WATCHDOG="/root/experiments/build/control-plane/watchdog/master_watchdog"
+
+# ---------------------------------------------------------------
+# Primary-standby master configuration
+# ---------------------------------------------------------------
+PRIMARY_MASTER_ADDR="${TIANJIN_100G}:${GRPC_PORT}"
+STANDBY_HOST="${FUJIAN_IP}"
+STANDBY_MASTER_ADDR="${FUJIAN_100G}:${GRPC_PORT}"
+
+# ---------------------------------------------------------------
+# Experiment D/E/F: Chapter 3 experiments
+# ---------------------------------------------------------------
+mkdir -p "${DATA_DIR}"/{D,E,F} 2>/dev/null
+
+# Heartbeat and state machine parameters
+HEARTBEAT_INTERVAL_MS=3000
+SUSPECT_THRESHOLD_S=15
+OFFLINE_THRESHOLD_S=45
