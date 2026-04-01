@@ -1,4 +1,4 @@
-# metric_push_v2 — Enhanced metric shipper with Comch + gRPC fallback.
+# metric_push — Enhanced metric shipper with Comch + gRPC fallback.
 # Links: Comch host C lib, cluster_proto (gRPC stubs), gRPC, pthreads.
 
 option(ENABLE_DOCA "Enable DOCA Comch support" ON)
@@ -22,23 +22,23 @@ if(ENABLE_DOCA AND NOT TARGET comch_host_c)
     )
 endif()
 
-# --- metric_push_v2 executable ---
-add_executable(metric_push_v2 metric_push.cc)
+# --- metric_push executable ---
+add_executable(metric_push metric_push.cc)
 
-target_include_directories(metric_push_v2 PRIVATE
+target_include_directories(metric_push PRIVATE
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/tunnel
 )
 
-target_link_libraries(metric_push_v2 PRIVATE
+target_link_libraries(metric_push PRIVATE
     cluster_proto
     gRPC::grpc++
     Threads::Threads
 )
 
 if(ENABLE_DOCA)
-    target_link_libraries(metric_push_v2 PRIVATE comch_host_c)
-    target_include_directories(metric_push_v2 PRIVATE ${DOCA_INC_DIR})
+    target_link_libraries(metric_push PRIVATE comch_host_c)
+    target_include_directories(metric_push PRIVATE ${DOCA_INC_DIR})
 else()
-    target_compile_definitions(metric_push_v2 PRIVATE NO_DOCA)
+    target_compile_definitions(metric_push PRIVATE NO_DOCA)
 endif()

@@ -311,7 +311,7 @@ Master (tianjin):
   BF2:   master_watchdog --master-grpc-addr=192.168.100.1:50051
 
 Worker (fujian, helong):
-  Host:  metric_push_v2 --pci=0000:5e:00.0 --master-addr=192.168.56.10:50051
+  Host:  metric_push --pci=0000:5e:00.0 --master-addr=192.168.56.10:50051
   BF2:   slave_agent --node-uuid=<auto> --master-addr=192.168.56.10:50051
 ```
 
@@ -333,4 +333,4 @@ Worker (fujian, helong):
 | control-plane/slave/host_collector.{h,cc} | C++ | 160 | Comch host metric proxy |
 | control-plane/watchdog/master_watchdog.cc | C++ | 200 | Master health monitor |
 | bench/metric_push/metric_push.cc | C++ | 200 | Host metric push + fallback |
-| bench/mock_slave/mock_slave_grpc.cc | C++ | 250 | Scalability testing |
+| bench/mock_slave/mock_slave.cc | C++ | 250 | Scalability testing |

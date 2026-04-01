@@ -263,18 +263,18 @@ ssh root@192.168.100.2 "pkg-config --modversion grpc++ && echo 'BF2 gRPC OK'"
 ## 5b. Compile: gRPC Components (CMake build)
 
 ```bash
-# On tianjin (master — builds cluster_master, mock_slave_grpc, metric_push_v2):
+# On tianjin (master — builds cluster_master, mock_slave, metric_push):
 cd ~/experiments
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 echo "Master build done"
 
-# On fujian + helong (workers — only need metric_push_v2):
+# On fujian + helong (workers — only need metric_push):
 for host in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
     cd ~/experiments &&
     cmake -B build -DCMAKE_BUILD_TYPE=Release &&
-    cmake --build build --target metric_push_v2 -j\$(nproc) &&
+    cmake --build build --target metric_push -j\$(nproc) &&
     echo 'Worker build OK'
   " &
 done
@@ -298,7 +298,7 @@ wait
 ```bash
 source ~/experiments/scripts/config.sh
 ls "${CLUSTER_MASTER}" "${MOCK_SLAVE_GRPC}" && echo "Master binaries OK"
-ssh $(whoami)@172.28.4.77 "ls ~/experiments/build/bench/metric_push/metric_push_v2 && echo 'Worker binary OK'"
+ssh $(whoami)@172.28.4.77 "ls ~/experiments/build/bench/metric_push/metric_push && echo 'Worker binary OK'"
 ssh root@192.168.100.2 "ls ~/experiments/build/control-plane/slave/slave_agent && echo 'BF2 binary OK'"
 ```
 

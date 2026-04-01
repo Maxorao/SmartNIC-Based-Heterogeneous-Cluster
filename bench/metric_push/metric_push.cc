@@ -9,7 +9,7 @@
  *                to re-init Comch and switch back when recovered.
  *
  * Usage:
- *   metric_push_v2 --pci=0000:5e:00.0 --interval=1000 \
+ *   metric_push --pci=0000:5e:00.0 --interval=1000 \
  *       --node-id=fujian --master-addr=localhost:50051
  */
 

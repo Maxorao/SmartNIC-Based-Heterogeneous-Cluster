@@ -1,5 +1,5 @@
 /*
- * mock_slave_grpc.cc — gRPC scalability test for cluster_master.
+ * mock_slave.cc — gRPC scalability test for cluster_master.
  *
  * Simulates N slave nodes as threads.  Each thread opens a
  * ClusterControl::NodeSession bidirectional stream, sends a RegisterRequest,
@@ -10,7 +10,7 @@
  * Prints a summary table matching the existing mock_slave.c format.
  *
  * Usage:
- *   mock_slave_grpc --master-addr=localhost:50051 --nodes=4 \
+ *   mock_slave --master-addr=localhost:50051 --nodes=4 \
  *       --duration=60 --interval=1000
  */
 
@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr,
-            "mock_slave_grpc: master=%s  nodes=%d  duration=%ds  interval=%ums\n",
+            "mock_slave: master=%s  nodes=%d  duration=%ds  interval=%ums\n",
             g_master_addr.c_str(), g_nodes, g_duration, g_interval_ms);
 
     g_stats.resize(g_nodes);
@@ -314,7 +314,7 @@ int main(int argc, char *argv[])
     uint64_t total_sent   = 0, total_acked  = 0, total_errors = 0;
     uint64_t total_lat    = 0, lat_count    = 0;
 
-    printf("\n=== mock_slave_grpc results (%d nodes) ===\n", g_nodes);
+    printf("\n=== mock_slave results (%d nodes) ===\n", g_nodes);
     printf("%-16s  %8s  %8s  %8s  %12s  %12s\n",
            "node_id", "sent", "acked", "errors", "avg_lat_ms", "reg_lat_ms");
 

@@ -126,8 +126,8 @@ BUILD_DIR="${EXP_BASE}/build"
 CLUSTER_MASTER="${BUILD_DIR}/control-plane/master/cluster_master"
 SLAVE_AGENT="${BUILD_DIR}/control-plane/slave/slave_agent"
 MASTER_WATCHDOG="${BUILD_DIR}/control-plane/watchdog/master_watchdog"
-METRIC_PUSH_V2="${BUILD_DIR}/bench/metric_push/metric_push_v2"
-MOCK_SLAVE_GRPC="${BUILD_DIR}/bench/mock_slave/mock_slave_grpc"
+METRIC_PUSH_V2="${BUILD_DIR}/bench/metric_push/metric_push"
+MOCK_SLAVE="${BUILD_DIR}/bench/mock_slave/mock_slave"
 
 # Remote binary paths on BF2 ARM (Chapter 3 v2)
 NIC_SLAVE_AGENT="/root/experiments/build/control-plane/slave/slave_agent"
