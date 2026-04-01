@@ -59,20 +59,15 @@ DATA_DIR="${HOME}/exp_data"
 mkdir -p "${DATA_DIR}"/{A,B,C,kubelet} 2>/dev/null
 
 # ---------------------------------------------------------------
-# Binary paths (host side)
+# Binary paths — standalone benchmarks (Make build)
 # ---------------------------------------------------------------
 EXP_BASE="${HOME}/experiments"
 
 BENCH_HOST="${EXP_BASE}/bench/latency_bench/bench_host"
 GEMM_BENCH="${EXP_BASE}/bench/gemm_bench/gemm_bench"
-MOCK_SLAVE="${EXP_BASE}/bench/mock_slave/mock_slave"
-SLAVE_MONITOR="${EXP_BASE}/control-plane/slave/slave_monitor"
-MASTER_MONITOR="${EXP_BASE}/control-plane/master/master_monitor"
-METRIC_PUSH="${EXP_BASE}/bench/metric_push/metric_push"
 
 # Remote binary paths (on BF2 ARM)
 NIC_BENCH_NIC="/root/experiments/bench/latency_bench/bench_nic"
-NIC_FORWARD_ROUTINE="/root/experiments/control-plane/forwarder/forward_routine"
 
 # ---------------------------------------------------------------
 # Experiment B: Interference parameters
@@ -81,8 +76,7 @@ NIC_FORWARD_ROUTINE="/root/experiments/control-plane/forwarder/forward_routine"
 NUMA_NODE=0
 GEMM_THREADS=16
 
-# Number of slave_monitor / metric_push instances
-# (simulates kubelet + metrics + logging + health checks)
+# Number of metric_push instances for interference simulation
 N_MONITORS=8
 
 # Report interval per instance (ms)

@@ -155,97 +155,32 @@ which sockperf && echo "sockperf OK"
 
 ---
 
-## 4. Compile: Host-side (all hosts)
+## 4. Install Dependencies (all hosts + BF2s)
 
 ```bash
+# Host dependencies (OpenBLAS for benchmarks + gRPC++ for cluster management)
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
-    cd ~/experiments/tunnel/host          && make COMCH_HOST_DOCA_VER=31 &&
-    cd ~/experiments/control-plane/slave  && make &&
-    cd ~/experiments/control-plane/master && make &&
-    cd ~/experiments/bench/gemm_bench     && make &&
-    cd ~/experiments/bench/latency_bench  && make &&
-    cd ~/experiments/bench/mock_slave     && make &&
-    cd ~/experiments/bench/metric_push    && make &&
-    echo 'HOST BUILD OK'
-  " &
-done
-wait
-```
-
-**Verify:**
-```bash
-for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
-  ssh $(whoami)@${host} "
-    ls ~/experiments/bench/gemm_bench/gemm_bench \
-       ~/experiments/bench/metric_push/metric_push \
-       ~/experiments/control-plane/slave/slave_monitor \
-       ~/experiments/control-plane/master/master_monitor \
-       ~/experiments/bench/latency_bench/bench_host \
-    >/dev/null 2>&1 && echo '${host}: OK' || echo '${host}: FAIL'
-  "
-done
-```
-
----
-
-## 5. Compile: BF2-side (all BF2s)
-
-```bash
-for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
-  ssh $(whoami)@${host} "
-    BF=192.168.100.2
-    ssh root@\${BF} 'rm -rf ~/experiments && mkdir -p ~/experiments/bench'
-    scp -r ~/experiments/tunnel          root@\${BF}:~/experiments/
-    scp -r ~/experiments/control-plane   root@\${BF}:~/experiments/
-    scp -r ~/experiments/bench/latency_bench root@\${BF}:~/experiments/bench/
-    scp -r ~/experiments/common          root@\${BF}:~/experiments/
-    ssh root@\${BF} '
-      cd ~/experiments/tunnel/nic              && make COMCH_NIC_DOCA_VER=15 &&
-      cd ~/experiments/control-plane/forwarder && make &&
-      cd ~/experiments/bench/latency_bench     && make bench_nic &&
-      echo BF2_BUILD_OK
-    '
-  " &
-done
-wait
-```
-
-**Verify:**
-```bash
-for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
-  ssh $(whoami)@${host} "
-    ssh root@192.168.100.2 'ls ~/experiments/control-plane/forwarder/forward_routine \
-      ~/experiments/bench/latency_bench/bench_nic >/dev/null 2>&1 && echo BF2_OK || echo BF2_FAIL'
-  "
-done
-```
-
----
-
-## 5a. Install gRPC++ Dependencies (all hosts + BF2s)
-
-Required for the Chapter 3 v2 gRPC-based architecture.
-
-```bash
-# On all x86 hosts:
-for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
-  ssh $(whoami)@${host} "
-    sudo apt-get install -y -qq cmake libgrpc++-dev libprotobuf-dev \
-      protobuf-compiler-grpc libpq-dev 2>/dev/null &&
-    echo '${host}: gRPC deps OK'
+    sudo apt-get update -qq &&
+    sudo apt-get install -y -qq libopenblas-dev linux-tools-\$(uname -r) \
+      sysstat stress-ng sockperf python3-pip \
+      cmake libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc libpq-dev \
+      2>/dev/null &&
+    pip3 install -q numpy pandas &&
+    sudo sysctl -w kernel.perf_event_paranoid=1 &&
+    echo '${host}: deps OK'
   " &
 done
 wait
 
-# On all BF2 ARMs:
+# BF2 ARM dependencies (gRPC++ for slave_agent)
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
     ssh root@192.168.100.2 '
       apt-get update -qq &&
       apt-get install -y -qq cmake libgrpc++-dev libprotobuf-dev \
         protobuf-compiler-grpc 2>/dev/null &&
-      echo BF2_GRPC_DEPS_OK
+      echo BF2_DEPS_OK
     '
   " &
 done
@@ -260,16 +195,46 @@ ssh root@192.168.100.2 "pkg-config --modversion grpc++ && echo 'BF2 gRPC OK'"
 
 ---
 
-## 5b. Compile: gRPC Components (CMake build)
+## 5. Compile (all hosts + BF2s)
+
+### 5a. Compile: Standalone benchmarks (Make)
 
 ```bash
-# On tianjin (master — builds cluster_master, mock_slave, metric_push):
+for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    cd ~/experiments/tunnel/host          && make COMCH_HOST_DOCA_VER=31 &&
+    cd ~/experiments/bench/gemm_bench     && make &&
+    cd ~/experiments/bench/latency_bench  && make &&
+    echo 'BENCH BUILD OK'
+  " &
+done
+wait
+
+# BF2-side: tunnel + latency bench
+for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    BF=192.168.100.2
+    scp -r ~/experiments/tunnel ~/experiments/common ~/experiments/bench/latency_bench root@\${BF}:~/experiments/
+    ssh root@\${BF} '
+      cd ~/experiments/tunnel/nic          && make COMCH_NIC_DOCA_VER=15 &&
+      cd ~/experiments/bench/latency_bench && make bench_nic &&
+      echo BF2_BENCH_OK
+    '
+  " &
+done
+wait
+```
+
+### 5b. Compile: Cluster management (CMake)
+
+```bash
+# tianjin (master): cluster_master + mock_slave + metric_push
 cd ~/experiments
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 echo "Master build done"
 
-# On fujian + helong (workers — only need metric_push):
+# fujian + helong (workers): metric_push only
 for host in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
     cd ~/experiments &&
@@ -280,14 +245,16 @@ for host in 172.28.4.77 172.28.4.85; do
 done
 wait
 
-# On all BF2 ARMs (builds slave_agent, master_watchdog):
+# All BF2 ARMs: slave_agent + master_watchdog
 for host in 172.28.4.75 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host} "
-    ssh root@192.168.100.2 '
+    BF=192.168.100.2
+    scp -r ~/experiments/proto ~/experiments/control-plane ~/experiments/CMakeLists.txt root@\${BF}:~/experiments/
+    ssh root@\${BF} '
       cd ~/experiments &&
       cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOMCH_NIC_DOCA_VER=15 &&
       cmake --build build --target slave_agent master_watchdog -j\$(nproc) &&
-      echo BF2_BUILD_V2_OK
+      echo BF2_CLUSTER_OK
     '
   " &
 done
@@ -297,39 +264,38 @@ wait
 **Verify:**
 ```bash
 source ~/experiments/scripts/config.sh
-ls "${CLUSTER_MASTER}" "${MOCK_SLAVE_GRPC}" && echo "Master binaries OK"
-ssh $(whoami)@172.28.4.77 "ls ~/experiments/build/bench/metric_push/metric_push && echo 'Worker binary OK'"
-ssh root@192.168.100.2 "ls ~/experiments/build/control-plane/slave/slave_agent && echo 'BF2 binary OK'"
+ls "${CLUSTER_MASTER}" "${MOCK_SLAVE}" && echo "Master binaries OK"
+ssh $(whoami)@172.28.4.77 "ls ~/experiments/build/bench/metric_push/metric_push && echo 'Worker OK'"
+ssh root@192.168.100.2 "ls ~/experiments/build/control-plane/slave/slave_agent && echo 'BF2 OK'"
 ```
 
 ---
 
 ## 6. Experiment D — Fault Recovery (Chapter 3)
 
-This experiment measures the system's fault detection and recovery time
-under two failure scenarios.
+Measures fault detection and recovery time under three failure scenarios.
 
 ### Architecture
 
 ```
 tianjin (master):
-  master_monitor :9000  ← monitors all node heartbeats
+  cluster_master :50051 (gRPC)  ← receives heartbeats from all slave_agents
+  master_watchdog (BF2)         ← monitors cluster_master via Comch + gRPC
 
 fujian (worker, fault injection target):
-  slave_monitor → Comch → BF2 forward_routine → TCP → master_monitor
-                                ↑
-                           kill -9 here (Scenario 1)
-         ↑
-    kill + restart here (Scenario 2)
+  metric_push (host) → Comch → slave_agent (BF2) → gRPC → cluster_master
+       ↑                              ↑
+  kill here (Scenario 2)         kill here (Scenario 1)
+
+  metric_push ··· fallback gRPC (direct) ··→ cluster_master  (Scenario 3)
 ```
 
 ### 6a. Pre-flight: Install TimescaleDB (if not already installed)
 
 ```bash
-# Check if DB is ready
-psql -h localhost -U postgres -d cluster_metrics -c "SELECT 1;" 2>/dev/null && echo "DB OK — skip to 6b" && exit 0
+psql -h localhost -U postgres -d cluster_metrics -c "SELECT 1;" 2>/dev/null && echo "DB OK — skip to 6b"
 
-# Install TimescaleDB (Ubuntu 22.04)
+# If not OK:
 sudo apt-get install -y gnupg postgresql-common apt-transport-https lsb-release wget
 sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
 echo "deb https://packagecloud.io/timescale/timescaledb/ubuntu/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/timescaledb.list
@@ -341,8 +307,6 @@ sudo systemctl restart postgresql
 sudo -u postgres psql -c "CREATE DATABASE cluster_metrics;" 2>/dev/null
 sudo -u postgres psql -d cluster_metrics -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-
-# Verify
 psql -h localhost -U postgres -d cluster_metrics -c "SELECT default_version FROM pg_extension WHERE extname='timescaledb';"
 ```
 
@@ -352,60 +316,62 @@ psql -h localhost -U postgres -d cluster_metrics -c "SELECT default_version FROM
 source ~/experiments/scripts/config.sh
 mkdir -p ~/exp_data/D
 
-# Start master_monitor with DB persistence on tianjin
-pkill -f master_monitor 2>/dev/null; sleep 1
-"${MASTER_MONITOR}" --port=${MASTER_PORT} \
+# Start cluster_master on tianjin
+pkill -f cluster_master 2>/dev/null; sleep 1
+"${CLUSTER_MASTER}" --grpc-port=${GRPC_PORT} \
   --db-connstr="${DB_CONNSTR}" \
-  > ~/exp_data/D/master_monitor.log 2>&1 &
+  > ~/exp_data/D/cluster_master.log 2>&1 &
 MASTER_PID=$!
 sleep 3
-echo "master_monitor started (PID=${MASTER_PID})"
+echo "cluster_master started (PID=${MASTER_PID})"
 
-# Start forward_routine on fujian BF2
+# Start slave_agent on fujian BF2
 ssh $(whoami)@172.28.4.77 "
   ssh root@192.168.100.2 '
-    pkill -f forward_routine 2>/dev/null; sleep 1
-    nohup ~/experiments/control-plane/forwarder/forward_routine \
-      --pci=03:00.0 \
-      --master-ip=192.168.56.10 \
-      --master-port=9000 \
-      > /tmp/forward_routine.log 2>&1 &
+    pkill -f slave_agent 2>/dev/null; sleep 1
+    nohup ~/experiments/build/control-plane/slave/slave_agent \
+      --node-uuid=fujian-bf2 \
+      --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+      --dev-pci=${NIC_PCI} \
+      --heartbeat-ms=${HEARTBEAT_INTERVAL_MS} \
+      > /tmp/slave_agent.log 2>&1 &
   '
 "
 sleep 3
-echo "forward_routine started on fujian BF2"
+echo "slave_agent started on fujian BF2"
 
-# Start slave_monitor on fujian host (offload mode)
+# Start metric_push on fujian host
 ssh $(whoami)@172.28.4.77 "
-  pkill -f slave_monitor 2>/dev/null; sleep 1
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload \
-    --pci=0000:5e:00.0 \
+  pkill -f metric_push 2>/dev/null; sleep 1
+  nohup ~/experiments/build/bench/metric_push/metric_push \
+    --pci=${HOST_PCI} \
     --interval=1000 \
-    --node-id=fujian-worker \
-    > ~/exp_data/D/slave_monitor.log 2>&1 &
+    --node-id=fujian-host \
+    --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+    > ~/exp_data/D/metric_push.log 2>&1 &
 "
-sleep 5
-echo "slave_monitor started on fujian"
+sleep 3
+echo "metric_push started on fujian host"
 
 # Also start on helong (healthy node for comparison)
 ssh $(whoami)@172.28.4.85 "
   ssh root@192.168.100.2 '
-    pkill -f forward_routine 2>/dev/null; sleep 1
-    nohup ~/experiments/control-plane/forwarder/forward_routine \
-      --pci=03:00.0 \
-      --master-ip=192.168.56.10 \
-      --master-port=9000 \
-      > /tmp/forward_routine.log 2>&1 &
+    pkill -f slave_agent 2>/dev/null; sleep 1
+    nohup ~/experiments/build/control-plane/slave/slave_agent \
+      --node-uuid=helong-bf2 \
+      --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+      --dev-pci=${NIC_PCI} \
+      --heartbeat-ms=${HEARTBEAT_INTERVAL_MS} \
+      > /tmp/slave_agent.log 2>&1 &
   '
   sleep 3
-  pkill -f slave_monitor 2>/dev/null; sleep 1
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload \
-    --pci=0000:5e:00.0 \
+  pkill -f metric_push 2>/dev/null; sleep 1
+  nohup ~/experiments/build/bench/metric_push/metric_push \
+    --pci=${HOST_PCI} \
     --interval=1000 \
-    --node-id=helong-worker \
-    > ~/exp_data/D/slave_monitor.log 2>&1 &
+    --node-id=helong-host \
+    --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+    > ~/exp_data/D/metric_push.log 2>&1 &
 "
 sleep 5
 echo "helong also running"
@@ -413,30 +379,32 @@ echo "helong also running"
 # Verify: all nodes registered
 echo "=== Registered nodes ==="
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT node_id, online, last_seen FROM node_status ORDER BY node_id;"
+  "SELECT node_uuid, state, host_status, bf2_status, last_seen FROM node_registry ORDER BY node_uuid;"
 ```
 
-**Verification**: You should see fujian-worker and helong-worker with `online=true`.
+**Verification**: You should see fujian-bf2 and helong-bf2 with `state=online`.
 Wait at least 10 seconds to confirm heartbeats are flowing before proceeding.
 
-### 6c. Scenario 1 — forward_routine crash (5 repetitions)
+### 6c. Scenario 1 — slave_agent crash on BF2 (5 repetitions)
 
 ```bash
-echo "=== Scenario 1: forward_routine crash ==="
+echo "=== Scenario 1: slave_agent crash on BF2 ==="
 echo "run,t_fault_epoch_ms,detection_ms,recovery_ms" > ~/exp_data/D/scenario1.csv
 
 for i in $(seq 1 5); do
   echo "--- Run ${i}/5 ---"
-  LOG_LINES_BEFORE=$(wc -l < ~/exp_data/D/master_monitor.log)
+  LOG_LINES_BEFORE=$(wc -l < ~/exp_data/D/cluster_master.log)
   T_FAULT=$(date +%s%3N)
 
-  ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'kill -9 \$(pgrep -f forward_routine) 2>/dev/null'"
-  echo "  t=${T_FAULT}: forward_routine killed on fujian BF2"
+  # Kill slave_agent on fujian BF2
+  ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'kill -9 \$(pgrep -f slave_agent) 2>/dev/null'"
+  echo "  t=${T_FAULT}: slave_agent killed on fujian BF2"
 
+  # Wait for master to detect (poll log for suspect/offline)
   T_DETECT=-1
   for attempt in $(seq 1 60); do
     sleep 1
-    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/master_monitor.log | grep -qi "fujian-worker.*offline\|fujian-worker.*timeout\|fujian-worker.*lost\|fujian-worker.*disconnect"; then
+    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/cluster_master.log | grep -qi "fujian.*suspect\|fujian.*offline\|fujian.*disconnect"; then
       T_DETECT=$(date +%s%3N)
       break
     fi
@@ -450,20 +418,23 @@ for i in $(seq 1 5); do
     echo "  Detection time: ${DET_MS} ms"
   fi
 
+  # Restart slave_agent on fujian BF2
   ssh $(whoami)@172.28.4.77 "
     ssh root@192.168.100.2 '
-      nohup ~/experiments/control-plane/forwarder/forward_routine \
-        --pci=03:00.0 \
-        --master-ip=192.168.56.10 \
-        --master-port=9000 \
-        > /tmp/forward_routine.log 2>&1 &
+      nohup ~/experiments/build/control-plane/slave/slave_agent \
+        --node-uuid=fujian-bf2 \
+        --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+        --dev-pci=${NIC_PCI} \
+        --heartbeat-ms=${HEARTBEAT_INTERVAL_MS} \
+        > /tmp/slave_agent.log 2>&1 &
     '
   "
 
+  # Wait for recovery (node back online)
   T_RECOVER=-1
   for attempt in $(seq 1 60); do
     sleep 1
-    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/master_monitor.log | grep -qi "fujian-worker.*online\|fujian-worker.*registered\|fujian-worker.*reconnect"; then
+    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/cluster_master.log | grep -qi "fujian.*online\|fujian.*register"; then
       T_RECOVER=$(date +%s%3N)
       break
     fi
@@ -487,47 +458,55 @@ echo "=== Scenario 1 Results ==="
 cat ~/exp_data/D/scenario1.csv
 ```
 
-### 6d. Scenario 2 — slave_monitor restart (5 repetitions)
+### 6d. Scenario 2 — metric_push graceful degradation (5 repetitions)
+
+When Comch/BF2 fails, metric_push auto-switches to direct gRPC to cluster_master.
 
 ```bash
-echo "=== Scenario 2: slave_monitor restart ==="
-echo "run,t_restart_epoch_ms,reregistration_ms" > ~/exp_data/D/scenario2.csv
+echo "=== Scenario 2: metric_push degradation ==="
+echo "run,t_fault_epoch_ms,switch_ms" > ~/exp_data/D/scenario2.csv
 
 for i in $(seq 1 5); do
   echo "--- Run ${i}/5 ---"
-  LOG_LINES_BEFORE=$(wc -l < ~/exp_data/D/master_monitor.log)
-  T_RESTART=$(date +%s%3N)
+  LOG_LINES_BEFORE=$(wc -l < ~/exp_data/D/cluster_master.log)
+  T_FAULT=$(date +%s%3N)
 
-  ssh $(whoami)@172.28.4.77 "
-    sudo pkill -f slave_monitor 2>/dev/null
-    sleep 2
-    sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-      --mode=offload \
-      --pci=0000:5e:00.0 \
-      --interval=1000 \
-      --node-id=fujian-worker \
-      > ~/exp_data/D/slave_monitor.log 2>&1 &
-  "
+  # Kill slave_agent (breaks Comch path) but keep metric_push running
+  ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'kill -9 \$(pgrep -f slave_agent) 2>/dev/null'"
+  echo "  t=${T_FAULT}: slave_agent killed, Comch path broken"
 
-  T_REREG=-1
+  # Wait for metric_push to switch to direct gRPC (should see DirectPush in master log)
+  T_SWITCH=-1
   for attempt in $(seq 1 30); do
     sleep 1
-    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/master_monitor.log | grep -qi "fujian-worker.*register\|fujian-worker.*online"; then
-      T_REREG=$(date +%s%3N)
+    if tail -n +${LOG_LINES_BEFORE} ~/exp_data/D/cluster_master.log | grep -qi "DirectPush\|direct.*fujian\|fallback"; then
+      T_SWITCH=$(date +%s%3N)
       break
     fi
   done
 
-  if [ "${T_REREG}" -eq -1 ]; then
-    REREG_MS="timeout"
-    echo "  WARNING: re-registration timeout"
+  if [ "${T_SWITCH}" -eq -1 ]; then
+    SW_MS="timeout"
+    echo "  WARNING: switch timeout (>30s)"
   else
-    REREG_MS=$(( T_REREG - T_RESTART ))
-    echo "  Re-registration time: ${REREG_MS} ms"
+    SW_MS=$(( T_SWITCH - T_FAULT ))
+    echo "  Degradation switch time: ${SW_MS} ms"
   fi
 
-  echo "${i},${T_RESTART},${REREG_MS}" >> ~/exp_data/D/scenario2.csv
-  sleep 10
+  # Restart slave_agent to restore normal path
+  ssh $(whoami)@172.28.4.77 "
+    ssh root@192.168.100.2 '
+      nohup ~/experiments/build/control-plane/slave/slave_agent \
+        --node-uuid=fujian-bf2 \
+        --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+        --dev-pci=${NIC_PCI} \
+        --heartbeat-ms=${HEARTBEAT_INTERVAL_MS} \
+        > /tmp/slave_agent.log 2>&1 &
+    '
+  "
+
+  echo "${i},${T_FAULT},${SW_MS}" >> ~/exp_data/D/scenario2.csv
+  sleep 15
 done
 
 echo ""
@@ -535,12 +514,82 @@ echo "=== Scenario 2 Results ==="
 cat ~/exp_data/D/scenario2.csv
 ```
 
-### 6e. Cleanup
+### 6e. Scenario 3 — cluster_master crash + watchdog restart (5 repetitions)
 
 ```bash
-pkill -f master_monitor 2>/dev/null
-ssh $(whoami)@172.28.4.77 "sudo pkill -f slave_monitor 2>/dev/null; ssh root@192.168.100.2 'pkill -f forward_routine 2>/dev/null'"
-ssh $(whoami)@172.28.4.85 "sudo pkill -f slave_monitor 2>/dev/null; ssh root@192.168.100.2 'pkill -f forward_routine 2>/dev/null'"
+echo "=== Scenario 3: cluster_master crash ==="
+echo "run,t_fault_epoch_ms,restart_ms,reconnect_ms" > ~/exp_data/D/scenario3.csv
+
+for i in $(seq 1 5); do
+  echo "--- Run ${i}/5 ---"
+  T_FAULT=$(date +%s%3N)
+
+  # Kill cluster_master
+  kill -9 ${MASTER_PID} 2>/dev/null
+  echo "  t=${T_FAULT}: cluster_master killed"
+
+  # Wait for master_watchdog to detect and restart (check if process comes back)
+  T_RESTART=-1
+  for attempt in $(seq 1 30); do
+    sleep 1
+    NEW_PID=$(pgrep -f cluster_master)
+    if [ -n "${NEW_PID}" ] && [ "${NEW_PID}" != "${MASTER_PID}" ]; then
+      T_RESTART=$(date +%s%3N)
+      MASTER_PID=${NEW_PID}
+      break
+    fi
+  done
+
+  if [ "${T_RESTART}" -eq -1 ]; then
+    # Watchdog didn't restart — manually restart
+    "${CLUSTER_MASTER}" --grpc-port=${GRPC_PORT} --db-connstr="${DB_CONNSTR}" \
+      > ~/exp_data/D/cluster_master.log 2>&1 &
+    MASTER_PID=$!
+    T_RESTART=$(date +%s%3N)
+    echo "  WARNING: manual restart needed"
+  fi
+  RESTART_MS=$(( T_RESTART - T_FAULT ))
+  echo "  Restart time: ${RESTART_MS} ms"
+
+  # Wait for slave_agents to reconnect
+  T_RECONNECT=-1
+  for attempt in $(seq 1 30); do
+    sleep 1
+    ONLINE=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
+      "SELECT COUNT(*) FROM node_registry WHERE state='online';" 2>/dev/null | tr -d ' ')
+    if [ "${ONLINE}" -ge 2 ]; then
+      T_RECONNECT=$(date +%s%3N)
+      break
+    fi
+  done
+
+  if [ "${T_RECONNECT}" -eq -1 ]; then
+    RECON_MS="timeout"
+  else
+    RECON_MS=$(( T_RECONNECT - T_FAULT ))
+  fi
+  echo "  Full reconnect time: ${RECON_MS} ms"
+
+  echo "${i},${T_FAULT},${RESTART_MS},${RECON_MS}" >> ~/exp_data/D/scenario3.csv
+  sleep 10
+done
+
+echo ""
+echo "=== Scenario 3 Results ==="
+cat ~/exp_data/D/scenario3.csv
+```
+
+### 6f. Cleanup
+
+```bash
+pkill -f cluster_master 2>/dev/null
+for host in 172.28.4.77 172.28.4.85; do
+  ssh $(whoami)@${host} "
+    pkill -f metric_push 2>/dev/null
+    ssh root@192.168.100.2 'pkill -f slave_agent 2>/dev/null'
+  " &
+done
+wait
 echo "All processes stopped"
 ```
 
@@ -556,37 +605,41 @@ Measures TimescaleDB performance: write throughput, query latency, compression r
 source ~/experiments/scripts/config.sh
 mkdir -p ~/exp_data/E
 
-pkill -f master_monitor 2>/dev/null; sleep 1
-"${MASTER_MONITOR}" --port=${MASTER_PORT} \
+# Start cluster_master
+pkill -f cluster_master 2>/dev/null; sleep 1
+"${CLUSTER_MASTER}" --grpc-port=${GRPC_PORT} \
   --db-connstr="${DB_CONNSTR}" \
-  > ~/exp_data/E/master_monitor.log 2>&1 &
-MASTER_PID=$!
+  > ~/exp_data/E/cluster_master.log 2>&1 &
 sleep 3
 
+# Start slave_agents on both worker BF2s
 for host_ip in 172.28.4.77 172.28.4.85; do
+  NODE_NAME=$([ "${host_ip}" = "172.28.4.77" ] && echo "fujian" || echo "helong")
   ssh $(whoami)@${host_ip} "
     ssh root@192.168.100.2 '
-      pkill -f forward_routine 2>/dev/null; sleep 1
-      nohup ~/experiments/control-plane/forwarder/forward_routine \
-        --pci=03:00.0 --master-ip=192.168.56.10 --master-port=9000 \
-        > /tmp/forward_routine.log 2>&1 &
+      pkill -f slave_agent 2>/dev/null; sleep 1
+      nohup ~/experiments/build/control-plane/slave/slave_agent \
+        --node-uuid=${NODE_NAME}-bf2 \
+        --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+        --dev-pci=${NIC_PCI} \
+        > /tmp/slave_agent.log 2>&1 &
     '
   " &
 done
 wait; sleep 3
 
-ssh $(whoami)@172.28.4.77 "
-  sudo pkill -f slave_monitor 2>/dev/null; sleep 1
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload --pci=0000:5e:00.0 --interval=1000 \
-    --node-id=fujian-worker > /tmp/slave_monitor.log 2>&1 &
-"
-ssh $(whoami)@172.28.4.85 "
-  sudo pkill -f slave_monitor 2>/dev/null; sleep 1
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload --pci=0000:5e:00.0 --interval=1000 \
-    --node-id=helong-worker > /tmp/slave_monitor.log 2>&1 &
-"
+# Start metric_push on both worker hosts
+for host_ip in 172.28.4.77 172.28.4.85; do
+  NODE_NAME=$([ "${host_ip}" = "172.28.4.77" ] && echo "fujian" || echo "helong")
+  ssh $(whoami)@${host_ip} "
+    pkill -f metric_push 2>/dev/null; sleep 1
+    nohup ~/experiments/build/bench/metric_push/metric_push \
+      --pci=${HOST_PCI} --interval=1000 --node-id=${NODE_NAME}-host \
+      --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+      > /tmp/metric_push.log 2>&1 &
+  " &
+done
+wait
 
 echo "System running. Collecting data for 5 minutes..."
 sleep 300
@@ -598,25 +651,26 @@ echo "Data collection complete."
 ```bash
 echo "=== DB Write Throughput Test ==="
 
+# Use mock_slave to generate high write load (64 simulated nodes, 60s)
 "${MOCK_SLAVE}" \
-  --master-ip=192.168.56.10 --master-port=9000 \
+  --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
   --nodes=64 --interval=1000 --duration=60 \
   > ~/exp_data/E/mock_64nodes.log 2>&1
 
 ROW_COUNT=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
-  "SELECT COUNT(*) FROM node_metrics WHERE time > NOW() - INTERVAL '2 minutes';")
+  "SELECT COUNT(*) FROM host_metrics WHERE time > NOW() - INTERVAL '2 minutes';")
 echo "Rows inserted (64 nodes, 60s): ${ROW_COUNT}"
 echo "Write rate: approximately $((ROW_COUNT / 60)) rows/s"
 
 sleep 5
 
 "${MOCK_SLAVE}" \
-  --master-ip=192.168.56.10 --master-port=9000 \
+  --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
   --nodes=256 --interval=1000 --duration=60 \
   > ~/exp_data/E/mock_256nodes.log 2>&1
 
 ROW_COUNT=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
-  "SELECT COUNT(*) FROM node_metrics WHERE time > NOW() - INTERVAL '2 minutes';")
+  "SELECT COUNT(*) FROM host_metrics WHERE time > NOW() - INTERVAL '2 minutes';")
 echo "Rows inserted (256 nodes, 60s): ${ROW_COUNT}"
 echo "Write rate: approximately $((ROW_COUNT / 60)) rows/s"
 ```
@@ -626,11 +680,11 @@ echo "Write rate: approximately $((ROW_COUNT / 60)) rows/s"
 ```bash
 echo "=== DB Query Latency Test ==="
 
-echo "--- Query: Latest node status ---"
+echo "--- Query: Node registry status ---"
 for i in $(seq 1 10); do
   psql -h localhost -U postgres -d cluster_metrics -c \
     "\\timing on
-     SELECT node_id, online, last_seen FROM node_status ORDER BY node_id;" \
+     SELECT node_uuid, state, host_status, bf2_status, last_seen FROM node_registry ORDER BY node_uuid;" \
     2>&1 | grep "Time:"
 done | tee ~/exp_data/E/query_status.txt
 
@@ -638,31 +692,30 @@ echo "--- Query: 5-min CPU aggregation ---"
 for i in $(seq 1 10); do
   psql -h localhost -U postgres -d cluster_metrics -c \
     "\\timing on
-     SELECT node_id, AVG(cpu_pct) as avg_cpu, MAX(cpu_pct) as max_cpu
-     FROM node_metrics
+     SELECT node_uuid, AVG(cpu_pct) as avg_cpu, MAX(cpu_pct) as max_cpu
+     FROM host_metrics
      WHERE time > NOW() - INTERVAL '5 minutes'
-     GROUP BY node_id ORDER BY node_id;" \
+     GROUP BY node_uuid ORDER BY node_uuid;" \
     2>&1 | grep "Time:"
 done | tee ~/exp_data/E/query_5min_agg.txt
 
-echo "--- Query: 1-hour CPU aggregation ---"
+echo "--- Query: 1-hour time-bucket aggregation ---"
 for i in $(seq 1 10); do
   psql -h localhost -U postgres -d cluster_metrics -c \
     "\\timing on
-     SELECT node_id, time_bucket('1 minute', time) AS bucket, AVG(cpu_pct) as avg_cpu
-     FROM node_metrics
+     SELECT node_uuid, time_bucket('1 minute', time) AS bucket, AVG(cpu_pct) as avg_cpu
+     FROM host_metrics
      WHERE time > NOW() - INTERVAL '1 hour'
-     GROUP BY node_id, bucket ORDER BY node_id, bucket;" \
+     GROUP BY node_uuid, bucket ORDER BY node_uuid, bucket;" \
     2>&1 | grep "Time:"
 done | tee ~/exp_data/E/query_1hour_agg.txt
 
 echo "--- Table statistics ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
   "SELECT hypertable_name, num_chunks,
-          pg_size_pretty(hypertable_size('node_metrics')) as total_size,
-          (SELECT COUNT(*) FROM node_metrics) as total_rows
+          pg_size_pretty(hypertable_size(format('%I', hypertable_name)::regclass)) as total_size
    FROM timescaledb_information.hypertables
-   WHERE hypertable_name = 'node_metrics';" | tee ~/exp_data/E/table_stats.txt
+   WHERE hypertable_name IN ('host_metrics', 'bf2_metrics');" | tee ~/exp_data/E/table_stats.txt
 ```
 
 ### 7d. Measure compression ratio
@@ -671,26 +724,24 @@ psql -h localhost -U postgres -d cluster_metrics -c \
 echo "=== Compression Test ==="
 
 BEFORE_SIZE=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
-  "SELECT pg_size_pretty(hypertable_size('node_metrics'));")
-BEFORE_ROWS=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
-  "SELECT COUNT(*) FROM node_metrics;")
-echo "Before compression: ${BEFORE_SIZE}, ${BEFORE_ROWS} rows"
+  "SELECT pg_size_pretty(hypertable_size('host_metrics'));")
+echo "Before compression: ${BEFORE_SIZE}"
 
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "ALTER TABLE node_metrics SET (
+  "ALTER TABLE host_metrics SET (
     timescaledb.compress,
-    timescaledb.compress_segmentby = 'node_id'
+    timescaledb.compress_segmentby = 'node_uuid'
   );" 2>/dev/null
 
 psql -h localhost -U postgres -d cluster_metrics -c \
   "SELECT compress_chunk(c.chunk_name)
    FROM timescaledb_information.chunks c
-   WHERE c.hypertable_name = 'node_metrics'
+   WHERE c.hypertable_name = 'host_metrics'
      AND NOT c.is_compressed
    ORDER BY c.range_start;" 2>/dev/null
 
 AFTER_SIZE=$(psql -h localhost -U postgres -d cluster_metrics -t -c \
-  "SELECT pg_size_pretty(hypertable_size('node_metrics'));")
+  "SELECT pg_size_pretty(hypertable_size('host_metrics'));")
 echo "After compression: ${AFTER_SIZE}"
 
 psql -h localhost -U postgres -d cluster_metrics -c \
@@ -698,18 +749,18 @@ psql -h localhost -U postgres -d cluster_metrics -c \
           pg_size_pretty(before_compression_total_bytes) as before,
           pg_size_pretty(after_compression_total_bytes) as after
    FROM timescaledb_information.compressed_chunk_stats
-   WHERE hypertable_name = 'node_metrics'
+   WHERE hypertable_name = 'host_metrics'
    ORDER BY chunk_name;" | tee ~/exp_data/E/compression_stats.txt
 ```
 
 ### 7e. Cleanup
 
 ```bash
-pkill -f master_monitor 2>/dev/null
+pkill -f cluster_master 2>/dev/null
 for host_ip in 172.28.4.77 172.28.4.85; do
   ssh $(whoami)@${host_ip} "
-    sudo pkill -f slave_monitor 2>/dev/null
-    ssh root@192.168.100.2 'pkill -f forward_routine 2>/dev/null'
+    pkill -f metric_push 2>/dev/null
+    ssh root@192.168.100.2 'pkill -f slave_agent 2>/dev/null'
   " &
 done
 wait
@@ -728,44 +779,56 @@ Captures log evidence for the thesis demonstrating node lifecycle management.
 source ~/experiments/scripts/config.sh
 mkdir -p ~/exp_data/F
 
+# Reset DB tables
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "DELETE FROM node_status; DROP TABLE IF EXISTS node_metrics CASCADE;" 2>/dev/null
+  "DROP TABLE IF EXISTS node_registry, host_metrics, bf2_metrics, cluster_events CASCADE;" 2>/dev/null
 
-pkill -f master_monitor 2>/dev/null; sleep 1
-"${MASTER_MONITOR}" --port=${MASTER_PORT} \
+# Start cluster_master (fresh DB schema)
+pkill -f cluster_master 2>/dev/null; sleep 1
+"${CLUSTER_MASTER}" --grpc-port=${GRPC_PORT} \
   --db-connstr="${DB_CONNSTR}" \
-  > ~/exp_data/F/master_monitor.log 2>&1 &
+  > ~/exp_data/F/cluster_master.log 2>&1 &
 sleep 3
 
+# Start slave_agent on fujian BF2
 ssh $(whoami)@172.28.4.77 "
   ssh root@192.168.100.2 '
-    pkill -f forward_routine 2>/dev/null; sleep 1
-    nohup ~/experiments/control-plane/forwarder/forward_routine \
-      --pci=03:00.0 --master-ip=192.168.56.10 --master-port=9000 \
-      > /tmp/forward_routine.log 2>&1 &
+    pkill -f slave_agent 2>/dev/null; sleep 1
+    nohup ~/experiments/build/control-plane/slave/slave_agent \
+      --node-uuid=fujian-bf2 \
+      --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+      --dev-pci=${NIC_PCI} \
+      > /tmp/slave_agent.log 2>&1 &
   '
 "
 sleep 3
 
+# Start metric_push on fujian host
 ssh $(whoami)@172.28.4.77 "
-  sudo pkill -f slave_monitor 2>/dev/null; sleep 1
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload --pci=0000:5e:00.0 --interval=1000 \
-    --node-id=fujian-worker > /tmp/slave_monitor.log 2>&1 &
+  pkill -f metric_push 2>/dev/null; sleep 1
+  nohup ~/experiments/build/bench/metric_push/metric_push \
+    --pci=${HOST_PCI} --interval=1000 --node-id=fujian-host \
+    --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+    > /tmp/metric_push.log 2>&1 &
 "
 sleep 10
 
+# Capture evidence
 echo "=== Registration Evidence ==="
-echo "--- master_monitor log (first 30 lines) ---"
-head -30 ~/exp_data/F/master_monitor.log | tee ~/exp_data/F/registration_log.txt
+echo "--- cluster_master log (first 30 lines) ---"
+head -30 ~/exp_data/F/cluster_master.log | tee ~/exp_data/F/registration_log.txt
 echo ""
-echo "--- node_status table ---"
+echo "--- node_registry table ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT * FROM node_status;" | tee ~/exp_data/F/node_status_after_reg.txt
+  "SELECT * FROM node_registry;" | tee ~/exp_data/F/node_registry_after_reg.txt
 echo ""
-echo "--- node_metrics (first 5 rows) ---"
+echo "--- host_metrics (first 5 rows) ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT * FROM node_metrics ORDER BY time LIMIT 5;" | tee ~/exp_data/F/first_metrics.txt
+  "SELECT * FROM host_metrics ORDER BY time LIMIT 5;" | tee ~/exp_data/F/first_host_metrics.txt
+echo ""
+echo "--- bf2_metrics (first 5 rows) ---"
+psql -h localhost -U postgres -d cluster_metrics -c \
+  "SELECT * FROM bf2_metrics ORDER BY time LIMIT 5;" | tee ~/exp_data/F/first_bf2_metrics.txt
 ```
 
 ### 8b. Capture heartbeat and resource reporting
@@ -775,56 +838,72 @@ echo "=== Heartbeat & Resource Reporting Evidence ==="
 echo "Let the system run for 30 seconds..."
 sleep 30
 
-echo "--- node_metrics count ---"
+echo "--- host_metrics count ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT node_id, COUNT(*) as report_count,
+  "SELECT node_uuid, COUNT(*) as report_count,
           MIN(time) as first_report, MAX(time) as last_report
-   FROM node_metrics GROUP BY node_id;" | tee ~/exp_data/F/report_count.txt
+   FROM host_metrics GROUP BY node_uuid;" | tee ~/exp_data/F/host_report_count.txt
 echo ""
-echo "--- Recent resource reports (last 5) ---"
+echo "--- bf2_metrics count ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT time, node_id, cpu_pct, mem_used_kb, mem_total_kb, net_rx_bps, net_tx_bps
-   FROM node_metrics ORDER BY time DESC LIMIT 5;" | tee ~/exp_data/F/recent_reports.txt
+  "SELECT node_uuid, COUNT(*) as report_count,
+          MIN(time) as first_report, MAX(time) as last_report
+   FROM bf2_metrics GROUP BY node_uuid;" | tee ~/exp_data/F/bf2_report_count.txt
 echo ""
-echo "--- node_status (should show last_seen updated) ---"
+echo "--- cluster_events ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT * FROM node_status;" | tee ~/exp_data/F/node_status_heartbeat.txt
+  "SELECT * FROM cluster_events ORDER BY time;" | tee ~/exp_data/F/events.txt
+echo ""
+echo "--- node_registry (should show last_seen updated) ---"
+psql -h localhost -U postgres -d cluster_metrics -c \
+  "SELECT * FROM node_registry;" | tee ~/exp_data/F/node_registry_heartbeat.txt
 ```
 
-### 8c. Capture node re-registration with same ID
+### 8c. Capture node re-registration with same UUID
 
 ```bash
 echo "=== Re-registration Evidence ==="
-ssh $(whoami)@172.28.4.77 "sudo pkill -f slave_monitor"
-echo "slave_monitor killed. Waiting 10s for timeout..."
-sleep 10
 
-echo "--- node_status after kill (should show offline) ---"
+# Kill slave_agent on fujian BF2
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'pkill -f slave_agent'"
+echo "slave_agent killed. Waiting 20s for suspect/offline transition..."
+sleep 20
+
+echo "--- node_registry after kill (should show suspect or offline) ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT * FROM node_status;" | tee ~/exp_data/F/node_status_offline.txt
+  "SELECT * FROM node_registry;" | tee ~/exp_data/F/node_registry_offline.txt
 
+# Restart with SAME UUID
 ssh $(whoami)@172.28.4.77 "
-  sudo nohup ~/experiments/control-plane/slave/slave_monitor \
-    --mode=offload --pci=0000:5e:00.0 --interval=1000 \
-    --node-id=fujian-worker > /tmp/slave_monitor.log 2>&1 &
+  ssh root@192.168.100.2 '
+    nohup ~/experiments/build/control-plane/slave/slave_agent \
+      --node-uuid=fujian-bf2 \
+      --master-addr=${TIANJIN_100G}:${GRPC_PORT} \
+      --dev-pci=${NIC_PCI} \
+      > /tmp/slave_agent.log 2>&1 &
+  '
 "
 sleep 10
 
-echo "--- node_status after re-registration (should show online, same ID) ---"
+echo "--- node_registry after re-registration (should show online, same UUID) ---"
 psql -h localhost -U postgres -d cluster_metrics -c \
-  "SELECT * FROM node_status;" | tee ~/exp_data/F/node_status_reregistered.txt
+  "SELECT * FROM node_registry;" | tee ~/exp_data/F/node_registry_reregistered.txt
 echo ""
-echo "--- master_monitor log showing re-registration ---"
-grep -i "fujian-worker" ~/exp_data/F/master_monitor.log | tail -20 | tee ~/exp_data/F/reregistration_log.txt
+echo "--- cluster_events showing lifecycle ---"
+psql -h localhost -U postgres -d cluster_metrics -c \
+  "SELECT * FROM cluster_events ORDER BY time;" | tee ~/exp_data/F/lifecycle_events.txt
+echo ""
+echo "--- cluster_master log showing re-registration ---"
+grep -i "fujian" ~/exp_data/F/cluster_master.log | tail -20 | tee ~/exp_data/F/reregistration_log.txt
 ```
 
 ### 8d. Cleanup
 
 ```bash
-pkill -f master_monitor 2>/dev/null
+pkill -f cluster_master 2>/dev/null
 ssh $(whoami)@172.28.4.77 "
-  sudo pkill -f slave_monitor 2>/dev/null
-  ssh root@192.168.100.2 'pkill -f forward_routine 2>/dev/null'
+  pkill -f metric_push 2>/dev/null
+  ssh root@192.168.100.2 'pkill -f slave_agent 2>/dev/null'
 "
 echo "Cleanup done"
 ```
@@ -842,11 +921,14 @@ echo "============================================"
 
 echo ""
 echo "=== Experiment D: Fault Recovery ==="
-echo "--- Scenario 1: forward_routine crash ---"
+echo "--- Scenario 1: slave_agent crash ---"
 cat ~/exp_data/D/scenario1.csv
 echo ""
-echo "--- Scenario 2: slave_monitor restart ---"
+echo "--- Scenario 2: metric_push degradation ---"
 cat ~/exp_data/D/scenario2.csv
+echo ""
+echo "--- Scenario 3: cluster_master crash ---"
+cat ~/exp_data/D/scenario3.csv
 
 echo ""
 echo "=== Experiment E: Database Performance ==="
@@ -887,12 +969,13 @@ echo "============================================"
 | `enp94s0f1np1: No such device` | Check `ip link show`; use `ls /sys/class/net/ \| grep enp` |
 | Ping 192.168.56.x fails | Check OVS bridge: `ssh root@192.168.100.2 "ovs-vsctl show"` |
 | `doca_devinfo_create_list failed` | `sudo mlnx_bf_configure` or `echo 1 > /sys/bus/pci/rescan` |
-| Comch connect timeout | Check BF2 log: `ssh root@192.168.100.2 cat /tmp/forward_routine.log` |
+| Comch connect timeout | Check BF2 log: `ssh root@192.168.100.2 cat /tmp/slave_agent.log` |
 | `psql: connection refused` | `sudo systemctl start postgresql` |
 | `CREATE EXTENSION timescaledb fails` | Check `shared_preload_libraries = 'timescaledb'` in `postgresql.conf` |
-| `master_monitor: db connect failed` | Verify DB_CONNSTR in config.sh |
-| Log shows no timeout/offline detection | Check master_monitor heartbeat timeout config; grep log for actual patterns |
-| `mock_slave: connection refused` | Ensure master_monitor is running on port 9000 |
+| `cluster_master: db connect failed` | Verify DB_CONNSTR in config.sh |
+| `gRPC: connection refused` | Ensure cluster_master is running on port ${GRPC_PORT} |
+| Log shows no state transitions | Check heartbeat_interval and suspect_threshold in node_state.h |
+| `mock_slave: connection refused` | Ensure cluster_master is running: `pgrep -f cluster_master` |
 
 ---
 
