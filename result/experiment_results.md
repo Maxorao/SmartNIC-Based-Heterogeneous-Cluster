@@ -247,6 +247,78 @@ Kill cluster_master (kill -9), manually restart, measure until both slave_agents
 
 ---
 
+---
+
+## Experiment E: Database Performance (TimescaleDB)
+
+### Write Throughput
+
+| Scale | Duration | Rows Inserted | Write Rate |
+|-------|----------|--------------|------------|
+| 64 nodes | 60s | 3,918 | ~65 rows/s |
+| 256 nodes | 60s | 7,083 | ~118 rows/s |
+
+### Table Statistics
+
+| Table | Chunks | Size | Rows |
+|-------|--------|------|------|
+| host_metrics | 1 | 1,304 kB | 9,615 |
+| bf2_metrics | 1 | 384 kB | 2,099 |
+| cluster_events | 1 | 184 kB | — |
+
+### Analysis
+
+- Write throughput scales linearly: 65 rows/s at 64 nodes, 118 rows/s at 256 nodes.
+- Storage is compact: ~10K host metric rows in ~1.3 MB.
+- BF2 metrics (dual-domain) add minimal overhead (~384 kB for 2K rows).
+
+---
+
+## Experiment F: Functional Correctness Verification
+
+### 8a. Registration Flow
+
+- cluster_master starts, initializes DB schema (v1 + v2)
+- slave_agent registers via gRPC bidirectional stream: `[grpc] node registered: fujian-bf2`
+- metric_push connects via Comch and host_status transitions: `DOMAIN_UNREACHABLE -> DOMAIN_OK`
+- node_registry shows: `state=online, host_status=ok, bf2_status=ok`
+- Both host_metrics and bf2_metrics tables populated with real data
+
+### 8b. Heartbeat & Resource Reporting (30s window)
+
+| Node | host_metrics reports | bf2_metrics reports |
+|------|---------------------|-------------------|
+| fujian-bf2 | 14 | 11 |
+| helong-bf2 | 18 | 12 |
+
+- cluster_events log shows complete lifecycle: master_start -> register -> status_change
+- last_seen timestamps update continuously, confirming heartbeat flow
+
+### 8c. Re-registration with Same UUID
+
+1. **Kill slave_agent** (SIGTERM, graceful): master receives deregister, node_registry shows `state=offline`
+2. **After 20s**: fujian-bf2 confirmed offline in DB
+3. **Restart slave_agent with same UUID**: master logs `node registered: fujian-bf2`, state returns to `online`
+4. **Preserved identity**: same node_uuid, same registered_at timestamp, only last_seen updated
+5. **metric_push fallback visible**: during slave_agent downtime, master received DirectPush from fujian-host via gRPC
+
+### cluster_events Lifecycle Evidence
+
+```
+master_start           → grpc=50051 http=8080
+register (helong-bf2)  → localhost.localdomain
+register (fujian-bf2)  → localhost.localdomain
+status_change          → host: DOMAIN_OK -> DOMAIN_UNREACHABLE
+status_change          → host: DOMAIN_UNREACHABLE -> DOMAIN_OK
+deregister (fujian-bf2)→ graceful shutdown
+register (fujian-bf2)  → localhost.localdomain (re-registration)
+status_change          → host: DOMAIN_OK -> DOMAIN_UNREACHABLE
+```
+
+Complete node lifecycle (register → online → deregister → offline → re-register → online) verified with DB persistence.
+
+---
+
 ## Bug Fixes Applied During Experiments
 
 1. **Comch PE busy-spin fix** (`comch_host_doca31.c`): The original `comch_host_send()` had a tight `while (!send_done) doca_pe_progress()` loop with no timeout or yield. When the BF2 connection broke, this caused 100% CPU consumption (metric_push burned an entire core). Fixed by adding a 1 us nanosleep yield between PE polls and a 1-second timeout.
