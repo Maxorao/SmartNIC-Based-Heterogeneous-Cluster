@@ -19,8 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <poll.h>
 
 #include <grpcpp/grpcpp.h>
 
@@ -39,17 +42,24 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 static std::atomic<bool> g_shutdown{false};
+static int g_signal_pipe[2] = {-1, -1};   /* self-pipe for signal notification */
 
 static void signal_handler(int /*sig*/)
 {
     g_shutdown.store(true);
+    /* Wake up the main loop via the self-pipe */
+    if (g_signal_pipe[1] >= 0) {
+        char c = 1;
+        (void)write(g_signal_pipe[1], &c, 1);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* Watchdog thread                                                     */
 /* ------------------------------------------------------------------ */
 
-static void watchdog_thread(NodeRegistry& registry, db_ctx_t* db)
+static void watchdog_thread(NodeRegistry& registry, db_ctx_t* db,
+                            std::mutex& db_mu)
 {
     fprintf(stderr, "[watchdog] started (1s interval)\n");
 
@@ -67,7 +77,7 @@ static void watchdog_thread(NodeRegistry& registry, db_ctx_t* db)
                         node_state_str(new_state));
 
                 if (db) {
-                    /* Log event */
+                    std::lock_guard<std::mutex> lk(db_mu);
                     std::string detail = std::string(node_state_str(old_state)) +
                                          " -> " + node_state_str(new_state);
                     db_insert_event(db, uuid.c_str(),
@@ -78,6 +88,7 @@ static void watchdog_thread(NodeRegistry& registry, db_ctx_t* db)
         /* Update DB registry for all nodes */
         if (db) {
             auto nodes = registry.snapshot();
+            std::lock_guard<std::mutex> lk(db_mu);
             for (const auto& e : nodes) {
                 db_upsert_node_registry(db,
                     e.node_uuid.c_str(),
@@ -144,8 +155,13 @@ int main(int argc, char* argv[])
     MasterConfig cfg = parse_args(argc, argv);
 
     /* ---- Signal handling ---- */
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    if (pipe(g_signal_pipe) < 0) { perror("pipe"); return 1; }
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART */
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     /* ---- Database ---- */
     db_ctx_t* db = db_connect(cfg.db_connstr.c_str());
@@ -196,10 +212,12 @@ int main(int argc, char* argv[])
     }
 
     /* ---- Watchdog thread ---- */
-    std::thread wd(watchdog_thread, std::ref(registry), db);
+    std::thread wd(watchdog_thread, std::ref(registry), db,
+                   std::ref(control_service.dbMutex()));
 
     /* ---- Log startup event ---- */
     if (db) {
+        std::lock_guard<std::mutex> lk(control_service.dbMutex());
         db_insert_event(db, nullptr, "master_start",
                         ("grpc=" + std::to_string(cfg.grpc_port) +
                          " http=" + std::to_string(cfg.http_port)).c_str());
@@ -211,9 +229,14 @@ int main(int argc, char* argv[])
             (unsigned)cfg.http_port,
             db ? "connected" : "none");
 
-    /* ---- Wait for shutdown ---- */
-    while (!g_shutdown.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    /* ---- Wait for shutdown (poll on self-pipe) ---- */
+    {
+        struct pollfd pfd{};
+        pfd.fd = g_signal_pipe[0];
+        pfd.events = POLLIN;
+        while (!g_shutdown.load()) {
+            poll(&pfd, 1, 500);  /* wakes on signal or every 500ms */
+        }
     }
 
     fprintf(stderr, "[master] shutting down...\n");
@@ -226,6 +249,7 @@ int main(int argc, char* argv[])
     if (wd.joinable()) wd.join();
 
     if (db) {
+        std::lock_guard<std::mutex> lk(control_service.dbMutex());
         db_insert_event(db, nullptr, "master_stop", "graceful shutdown");
         db_disconnect(db);
     }

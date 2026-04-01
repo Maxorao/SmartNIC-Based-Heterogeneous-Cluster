@@ -200,8 +200,12 @@ int main(int argc, char *argv[])
         }
     }
 
-    signal(SIGTERM, on_signal);
-    signal(SIGINT,  on_signal);
+    struct sigaction sa_sig{};
+    sa_sig.sa_handler = on_signal;
+    sigemptyset(&sa_sig.sa_mask);
+    sa_sig.sa_flags = 0;
+    sigaction(SIGTERM, &sa_sig, nullptr);
+    sigaction(SIGINT,  &sa_sig, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
     /* Initialize Comch NIC-side */

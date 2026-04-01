@@ -91,7 +91,7 @@ bool HostCollector::start()
                                        rep_pci_.c_str(),
                                        service_name_.c_str());
     if (err != DOCA_SUCCESS) {
-        hc_log("comch_nic_init failed: %s", doca_error_get_name(err));
+        hc_log("comch_nic_init failed: %s", doca_get_error_name(err));
         return false;
     }
 
@@ -146,7 +146,7 @@ void HostCollector::recvLoop()
             continue;
         }
         if (err != DOCA_SUCCESS) {
-            hc_log("recv error: %s", doca_error_get_name(err));
+            hc_log("recv error: %s", doca_get_error_name(err));
             sleep_ms(100);  // avoid tight error loop
             continue;
         }

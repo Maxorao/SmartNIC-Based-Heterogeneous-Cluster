@@ -383,8 +383,12 @@ int main(int argc, char* argv[])
 {
     Config cfg = parse_args(argc, argv);
 
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
     sa_log("starting: uuid=%s hostname=%s master=%s",

@@ -281,8 +281,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT,  sig_handler);
+    struct sigaction sa_sig{};
+    sa_sig.sa_handler = sig_handler;
+    sigemptyset(&sa_sig.sa_mask);
+    sa_sig.sa_flags = 0;
+    sigaction(SIGTERM, &sa_sig, nullptr);
+    sigaction(SIGINT,  &sa_sig, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr,

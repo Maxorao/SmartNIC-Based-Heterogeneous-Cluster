@@ -27,6 +27,9 @@ public:
     ClusterControlServiceImpl(NodeRegistry& registry, db_ctx_t* db)
         : registry_(registry), db_(db) {}
 
+    /* Expose db mutex for watchdog thread (shares same PGconn) */
+    std::mutex& dbMutex() { return db_mu_; }
+
     /*
      * Bidirectional stream: slave_agent registers, then sends heartbeats
      * and metric reports.  Master sends ACKs and commands.

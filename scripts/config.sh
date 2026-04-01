@@ -100,7 +100,7 @@ SCALE_DURATION=30
 # ---------------------------------------------------------------
 # DB connection (optional — for master_monitor persistence)
 # ---------------------------------------------------------------
-DB_CONNSTR="host=localhost dbname=cluster_metrics user=postgres password=postgres"
+DB_CONNSTR="host=localhost dbname=cluster_metrics user=postgres password=postgres sslmode=disable"
 
 # ===============================================================
 # Chapter 3 v2: gRPC-based architecture

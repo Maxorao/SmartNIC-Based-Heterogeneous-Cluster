@@ -161,8 +161,12 @@ int main(int argc, char *argv[])
     if (node_id[0] == '\0')
         gethostname(node_id, sizeof(node_id) - 1);
 
-    signal(SIGTERM, on_signal);
-    signal(SIGINT,  on_signal);
+    struct sigaction sa_sig{};
+    sa_sig.sa_handler = on_signal;
+    sigemptyset(&sa_sig.sa_mask);
+    sa_sig.sa_flags = 0;
+    sigaction(SIGTERM, &sa_sig, nullptr);
+    sigaction(SIGINT,  &sa_sig, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
     /* Initialize Comch */
@@ -259,6 +263,9 @@ int main(int argc, char *argv[])
                                 mem_total, mem_avail, 0, 0);
             if (ok) {
                 total_grpc_sent++;
+                if (total_grpc_sent <= 3 || total_grpc_sent % 10 == 0)
+                    fprintf(stderr, "[metric_push] gRPC push OK (#%" PRIu64 ")\n",
+                            total_grpc_sent);
             } else {
                 fprintf(stderr, "[metric_push] grpc DirectPush failed\n");
             }

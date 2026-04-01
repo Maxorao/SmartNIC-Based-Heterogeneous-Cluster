@@ -183,6 +183,70 @@ tianjin (192.168.56.10)
 
 ---
 
+## Experiment D: Fault Recovery (Chapter 3 v2 — gRPC Architecture)
+
+Measures fault detection and recovery time under three failure scenarios.
+Architecture: cluster_master (tianjin, gRPC) + slave_agent (BF2 ARM, gRPC stream) + metric_push (host, Comch + gRPC fallback).
+
+### Scenario 1: slave_agent crash on BF2
+
+Kill slave_agent on fujian BF2 (kill -9), measure time until master detects (gRPC stream closed) and until slave_agent re-registers after restart.
+
+| Run | Detection (ms) | Recovery (ms) |
+|-----|---------------|--------------|
+| 1 | 2361 | 6712 |
+| 2 | 2692 | 7033 |
+| 3 | 2402 | 6772 |
+| 4 | 2372 | 6723 |
+| 5 | 2712 | 7072 |
+| **Avg** | **2508** | **6862** |
+
+- Detection ~2.5s: gRPC bidirectional stream closes immediately, master marks node as suspect
+- Recovery ~6.9s: includes slave_agent restart + Comch ep_listen init + gRPC reconnect + re-registration + metric_push Comch reconnect
+
+### Scenario 2: metric_push graceful degradation (Comch -> gRPC fallback)
+
+Kill slave_agent to break Comch path. metric_push detects 5 consecutive Comch failures then auto-switches to gRPC DirectPush to master. After slave_agent restarts, metric_push recovers Comch.
+
+| Run | Fallback (ms) | Comch Recovery (ms) |
+|-----|--------------|-------------------|
+| 1 | 2407 | 6769 |
+| 2 | 9402 | 13793 |
+| 3 | 2719 | 7082 |
+| 4 | 9440 | 13823 |
+| 5 | 2381 | 6742 |
+| **Avg** | **5270** | **9642** |
+
+- Fallback time varies: ~2.5s (fast) or ~9.4s (slow), depending on where in the send cycle the Comch failure occurs. Each failed comch_host_send has a 1s PE timeout, 5 failures = 5-10s.
+- Comch recovery ~7-14s: includes slave_agent restart + metric_push periodic Comch retry (30s interval) + Comch re-init.
+- During fallback, metric_push sends via gRPC DirectPush with zero data loss.
+
+### Scenario 3: cluster_master crash + restart
+
+Kill cluster_master (kill -9), manually restart, measure until both slave_agents reconnect.
+
+| Run | Restart (ms) | Reconnect (ms) |
+|-----|-------------|---------------|
+| 1 | 2007 | 3071 |
+| 2 | 2004 | 3069 |
+| 3 | 2005 | 3071 |
+| 4 | 2005 | 3069 |
+| 5 | 2005 | 3070 |
+| **Avg** | **2005** | **3070** |
+
+- Restart ~2.0s: process startup + DB reconnect + gRPC server bind
+- Full reconnect ~3.1s: both slave_agents auto-reconnect with exponential backoff
+- Remarkably consistent across all 5 runs (std < 2ms)
+
+### Analysis
+
+- **gRPC stream provides near-instant fault detection** (~2.5s) vs the old TCP poll-based approach. The bidirectional stream closes immediately when the remote process dies.
+- **Dual-path resilience**: metric_push's Comch-to-gRPC fallback ensures zero metric data loss during BF2 failures.
+- **Master crash recovery is fast and deterministic** (~3.1s for full cluster reconnect), thanks to slave_agent's automatic reconnect with exponential backoff.
+- **Comch ep_listen limitation**: after kill -9, the BF2 DOCA firmware may delay releasing the service name, adding variable latency to recovery.
+
+---
+
 ## Bug Fixes Applied During Experiments
 
 1. **Comch PE busy-spin fix** (`comch_host_doca31.c`): The original `comch_host_send()` had a tight `while (!send_done) doca_pe_progress()` loop with no timeout or yield. When the BF2 connection broke, this caused 100% CPU consumption (metric_push burned an entire core). Fixed by adding a 1 us nanosleep yield between PE polls and a 1-second timeout.

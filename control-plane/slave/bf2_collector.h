@@ -35,10 +35,11 @@ public:
      */
     BF2Metrics collect();
 
-private:
     struct CpuStat {
         uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
     };
+
+private:
 
     CpuStat prev_cpu_{};
 

@@ -71,14 +71,17 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
             reg.pci_bus_id(),
             now);
 
-        /* Persist to DB */
-        if (db_) {
-            db_upsert_node_registry(db_, reg.node_uuid().c_str(),
-                                    reg.hostname().c_str(),
-                                    reg.pci_bus_id().c_str(),
-                                    "online", "ok", "ok");
-            db_insert_event(db_, reg.node_uuid().c_str(),
-                            "register", reg.hostname().c_str());
+        /* Persist to DB (thread-safe) */
+        {
+            std::lock_guard<std::mutex> lk(db_mu_);
+            if (db_) {
+                db_upsert_node_registry(db_, reg.node_uuid().c_str(),
+                                        reg.hostname().c_str(),
+                                        reg.pci_bus_id().c_str(),
+                                        "online", "ok", "ok");
+                db_insert_event(db_, reg.node_uuid().c_str(),
+                                "register", reg.hostname().c_str());
+            }
         }
 
         fprintf(stderr, "[grpc] node registered: %s (%s) from %s\n",
@@ -125,15 +128,18 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
         case cluster::NodeMessage::kResourceReport: {
             const auto& rr = msg.resource_report();
 
-            if (db_) {
-                db_insert_host_metrics(db_,
-                    rr.node_uuid().c_str(),
-                    rr.timestamp_ns(),
-                    rr.cpu_usage_pct(),
-                    rr.mem_total_kb(),
-                    rr.mem_avail_kb(),
-                    rr.net_rx_bytes(),
-                    rr.net_tx_bytes());
+            {
+                std::lock_guard<std::mutex> lk(db_mu_);
+                if (db_) {
+                    db_insert_host_metrics(db_,
+                        rr.node_uuid().c_str(),
+                        rr.timestamp_ns(),
+                        rr.cpu_usage_pct(),
+                        rr.mem_total_kb(),
+                        rr.mem_avail_kb(),
+                        rr.net_rx_bytes(),
+                        rr.net_tx_bytes());
+                }
             }
 
             /* Send ReportAck */
@@ -147,18 +153,21 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
         case cluster::NodeMessage::kBf2Report: {
             const auto& br = msg.bf2_report();
 
-            if (db_) {
-                db_insert_bf2_metrics(db_,
-                    br.node_uuid().c_str(),
-                    br.timestamp_ns(),
-                    br.arm_cpu_pct(),
-                    br.arm_mem_total_kb(),
-                    br.arm_mem_avail_kb(),
-                    br.temperature_c(),
-                    br.port_rx_bytes(),
-                    br.port_tx_bytes(),
-                    br.port_rx_drops(),
-                    br.ovs_flow_count());
+            {
+                std::lock_guard<std::mutex> lk(db_mu_);
+                if (db_) {
+                    db_insert_bf2_metrics(db_,
+                        br.node_uuid().c_str(),
+                        br.timestamp_ns(),
+                        br.arm_cpu_pct(),
+                        br.arm_mem_total_kb(),
+                        br.arm_mem_avail_kb(),
+                        br.temperature_c(),
+                        br.port_rx_bytes(),
+                        br.port_tx_bytes(),
+                        br.port_rx_drops(),
+                        br.ovs_flow_count());
+                }
             }
             break;
         }
@@ -173,13 +182,16 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
                     cluster::DomainStatus_Name(sc.new_status()).c_str(),
                     sc.reason().c_str());
 
-            if (db_) {
+            {
                 std::string detail = sc.domain() + ": " +
                     cluster::DomainStatus_Name(sc.old_status()) + " -> " +
                     cluster::DomainStatus_Name(sc.new_status()) +
                     " (" + sc.reason() + ")";
-                db_insert_event(db_, node_uuid.c_str(),
-                                "status_change", detail.c_str());
+                std::lock_guard<std::mutex> lk(db_mu_);
+                if (db_) {
+                    db_insert_event(db_, node_uuid.c_str(),
+                                    "status_change", detail.c_str());
+                }
             }
             break;
         }
@@ -190,11 +202,14 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
             fprintf(stderr, "[grpc] node deregistered: %s reason=%s\n",
                     dr.node_uuid().c_str(), dr.reason().c_str());
 
-            if (db_) {
-                db_insert_event(db_, node_uuid.c_str(),
-                                "deregister", dr.reason().c_str());
-                db_upsert_node_registry(db_, node_uuid.c_str(),
-                                        "", "", "offline", "unknown", "unknown");
+            {
+                std::lock_guard<std::mutex> lk(db_mu_);
+                if (db_) {
+                    db_insert_event(db_, node_uuid.c_str(),
+                                    "deregister", dr.reason().c_str());
+                    db_upsert_node_registry(db_, node_uuid.c_str(),
+                                            "", "", "offline", "unknown", "unknown");
+                }
             }
 
             registry_.removeNode(node_uuid);
@@ -223,9 +238,12 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
     fprintf(stderr, "[grpc] stream closed for node %s, marking suspect\n",
             node_uuid.c_str());
 
-    if (db_) {
-        db_insert_event(db_, node_uuid.c_str(),
-                        "stream_closed", "bidirectional stream ended");
+    {
+        std::lock_guard<std::mutex> lk(db_mu_);
+        if (db_) {
+            db_insert_event(db_, node_uuid.c_str(),
+                            "stream_closed", "bidirectional stream ended");
+        }
     }
 
     /* Don't remove from registry — let the watchdog handle the transition
@@ -243,7 +261,11 @@ grpc::Status ClusterControlServiceImpl::DirectPush(
     const cluster::DirectPushRequest* request,
     cluster::DirectPushResponse* response)
 {
+    fprintf(stderr, "[grpc] DirectPush received from %s (cpu=%.1f%%)\n",
+            request->node_id().c_str(), request->cpu_usage_pct());
+
     if (db_) {
+        std::lock_guard<std::mutex> lk(db_mu_);
         int rc = db_insert_host_metrics(db_,
             request->node_id().c_str(),
             request->timestamp_ns(),
