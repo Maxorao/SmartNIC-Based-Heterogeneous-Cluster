@@ -105,6 +105,12 @@ int db_upsert_node_registry(db_ctx_t *ctx, const char *node_uuid, const char *ho
                             const char *pci_bus_id, const char *state,
                             const char *host_status, const char *bf2_status);
 
+/*
+ * Execute raw SQL (used by DbWriter for batch inserts).
+ * Returns 0 on success, -1 on failure (auto-reconnect once).
+ */
+int db_exec_sql(db_ctx_t *ctx, const char *sql);
+
 #ifdef __cplusplus
 }
 #endif

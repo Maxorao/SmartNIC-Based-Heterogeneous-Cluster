@@ -22,10 +22,12 @@ extern "C" {
 /* ClusterControl service                                              */
 /* ------------------------------------------------------------------ */
 
+class DbWriter;  /* forward declaration */
+
 class ClusterControlServiceImpl final : public cluster::ClusterControl::Service {
 public:
-    ClusterControlServiceImpl(NodeRegistry& registry, db_ctx_t* db)
-        : registry_(registry), db_(db) {}
+    ClusterControlServiceImpl(NodeRegistry& registry, db_ctx_t* db, DbWriter* writer = nullptr)
+        : registry_(registry), db_(db), writer_(writer) {}
 
     /* Expose db mutex for watchdog thread (shares same PGconn) */
     std::mutex& dbMutex() { return db_mu_; }
@@ -55,8 +57,9 @@ public:
 
 private:
     NodeRegistry& registry_;
-    db_ctx_t*     db_;
-    std::mutex    db_mu_;   // protects all db_ calls (PGconn is not thread-safe)
+    db_ctx_t*     db_;        // synchronous DB (for registry, low-freq ops)
+    DbWriter*     writer_;    // async batch writer (for metrics, high-freq ops)
+    std::mutex    db_mu_;     // protects db_ calls (PGconn is not thread-safe)
 };
 
 /* ------------------------------------------------------------------ */

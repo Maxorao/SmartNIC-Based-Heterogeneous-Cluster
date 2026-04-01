@@ -11,6 +11,7 @@
  */
 
 #include "grpc_service.h"
+#include "db_writer.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -128,45 +129,49 @@ grpc::Status ClusterControlServiceImpl::NodeSession(
         case cluster::NodeMessage::kResourceReport: {
             const auto& rr = msg.resource_report();
 
+            /* Send ReportAck immediately */
             {
+                cluster::MasterMessage reply;
+                auto* ra = reply.mutable_report_ack();
+                ra->set_seq(rr.timestamp_ns());
+                stream->Write(reply);
+            }
+
+            /* Persist: async batch writer (fast) or sync fallback */
+            if (writer_) {
+                writer_->enqueueHostMetrics(
+                    rr.node_uuid().c_str(), rr.timestamp_ns(),
+                    rr.cpu_usage_pct(), rr.mem_total_kb(), rr.mem_avail_kb(),
+                    rr.net_rx_bytes(), rr.net_tx_bytes());
+            } else {
                 std::lock_guard<std::mutex> lk(db_mu_);
                 if (db_) {
                     db_insert_host_metrics(db_,
-                        rr.node_uuid().c_str(),
-                        rr.timestamp_ns(),
-                        rr.cpu_usage_pct(),
-                        rr.mem_total_kb(),
-                        rr.mem_avail_kb(),
-                        rr.net_rx_bytes(),
-                        rr.net_tx_bytes());
+                        rr.node_uuid().c_str(), rr.timestamp_ns(),
+                        rr.cpu_usage_pct(), rr.mem_total_kb(), rr.mem_avail_kb(),
+                        rr.net_rx_bytes(), rr.net_tx_bytes());
                 }
             }
-
-            /* Send ReportAck */
-            cluster::MasterMessage reply;
-            auto* ra = reply.mutable_report_ack();
-            ra->set_seq(rr.timestamp_ns());  /* use timestamp as seq */
-            stream->Write(reply);
             break;
         }
 
         case cluster::NodeMessage::kBf2Report: {
             const auto& br = msg.bf2_report();
 
-            {
+            if (writer_) {
+                writer_->enqueueBF2Metrics(
+                    br.node_uuid().c_str(), br.timestamp_ns(),
+                    br.arm_cpu_pct(), br.arm_mem_total_kb(), br.arm_mem_avail_kb(),
+                    br.temperature_c(), br.port_rx_bytes(), br.port_tx_bytes(),
+                    br.port_rx_drops(), br.ovs_flow_count());
+            } else {
                 std::lock_guard<std::mutex> lk(db_mu_);
                 if (db_) {
                     db_insert_bf2_metrics(db_,
-                        br.node_uuid().c_str(),
-                        br.timestamp_ns(),
-                        br.arm_cpu_pct(),
-                        br.arm_mem_total_kb(),
-                        br.arm_mem_avail_kb(),
-                        br.temperature_c(),
-                        br.port_rx_bytes(),
-                        br.port_tx_bytes(),
-                        br.port_rx_drops(),
-                        br.ovs_flow_count());
+                        br.node_uuid().c_str(), br.timestamp_ns(),
+                        br.arm_cpu_pct(), br.arm_mem_total_kb(), br.arm_mem_avail_kb(),
+                        br.temperature_c(), br.port_rx_bytes(), br.port_tx_bytes(),
+                        br.port_rx_drops(), br.ovs_flow_count());
                 }
             }
             break;
@@ -263,6 +268,15 @@ grpc::Status ClusterControlServiceImpl::DirectPush(
 {
     fprintf(stderr, "[grpc] DirectPush received from %s (cpu=%.1f%%)\n",
             request->node_id().c_str(), request->cpu_usage_pct());
+
+    if (writer_) {
+        writer_->enqueueHostMetrics(
+            request->node_id().c_str(), request->timestamp_ns(),
+            request->cpu_usage_pct(), request->mem_total_kb(), request->mem_avail_kb(),
+            request->net_rx_bytes(), request->net_tx_bytes());
+        response->set_accepted(true);
+        return grpc::Status::OK;
+    }
 
     if (db_) {
         std::lock_guard<std::mutex> lk(db_mu_);

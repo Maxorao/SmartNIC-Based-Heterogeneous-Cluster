@@ -1,0 +1,13 @@
+build/
+*.o
+bench/gemm_bench/gemm_bench
+bench/latency_bench/bench_host
+bench/latency_bench/bench_nic
+bench/metric_push/metric_push
+bench/mock_slave/mock_slave
+control-plane/master/cluster_master
+control-plane/master/master_monitor
+control-plane/slave/slave_monitor
+control-plane/slave/slave_agent
+control-plane/watchdog/master_watchdog
+*.csv

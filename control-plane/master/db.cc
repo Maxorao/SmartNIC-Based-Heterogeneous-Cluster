@@ -505,3 +505,21 @@ int db_upsert_node_registry(db_ctx_t *ctx, const char *node_uuid, const char *ho
     PQclear(res);
     return ok ? 0 : -1;
 }
+
+/* ------------------------------------------------------------------ */
+/* Raw SQL execution (for batch inserts from DbWriter)                 */
+/* ------------------------------------------------------------------ */
+
+int db_exec_sql(db_ctx_t *ctx, const char *sql)
+{
+    if (ensure_connected(ctx) < 0) return -1;
+
+    PGresult *res = PQexec(ctx->conn, sql);
+    ExecStatusType status = PQresultStatus(res);
+    int ok = (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK);
+    if (!ok) {
+        fprintf(stderr, "[db] batch exec failed: %s\n", PQerrorMessage(ctx->conn));
+    }
+    PQclear(res);
+    return ok ? 0 : -1;
+}

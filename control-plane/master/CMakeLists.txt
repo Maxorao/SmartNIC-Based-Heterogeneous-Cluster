@@ -21,6 +21,7 @@ add_executable(cluster_master
     node_registry.cc
     http_status.cc
     db.cc
+    db_writer.cc
 )
 
 target_include_directories(cluster_master PRIVATE

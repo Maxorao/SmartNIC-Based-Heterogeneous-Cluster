@@ -1,0 +1,49 @@
+all:
+  vars:
+    ansible_user: huaz
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    exp_base: "{{ ansible_env.HOME }}/experiments"
+    grpc_port: "50051"
+    tianjin_100g: "192.168.56.10"
+    nic_pci: "03:00.0"
+    host_pci: "0000:5e:00.0"
+    heartbeat_ms: "3000"
+    db_connstr: "host=localhost dbname=cluster_metrics user=postgres password=postgres"
+
+  children:
+    master:
+      hosts:
+        tianjin:
+          ansible_host: 172.28.4.75
+          ansible_connection: local
+
+    workers:
+      hosts:
+        fujian:
+          ansible_host: 172.28.4.77
+          node_uuid: fujian-bf2
+          node_id: fujian-host
+        helong:
+          ansible_host: 172.28.4.85
+          node_uuid: helong-bf2
+          node_id: helong-host
+
+    bf2:
+      hosts:
+        tianjin_bf2:
+          ansible_host: 192.168.100.2
+          ansible_user: root
+          ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+          parent_host: tianjin
+        fujian_bf2:
+          ansible_host: 192.168.100.2
+          ansible_user: root
+          ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyJump=huaz@172.28.4.77'
+          parent_host: fujian
+          node_uuid: fujian-bf2
+        helong_bf2:
+          ansible_host: 192.168.100.2
+          ansible_user: root
+          ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyJump=huaz@172.28.4.85'
+          parent_host: helong
+          node_uuid: helong-bf2

@@ -28,6 +28,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "grpc_service.h"
+#include "db_writer.h"
 #include "http_status.h"
 #include "node_registry.h"
 
@@ -177,8 +178,22 @@ int main(int argc, char* argv[])
     /* ---- Node registry ---- */
     NodeRegistry registry;
 
+    /* ---- Async batch DB writer ---- */
+    std::unique_ptr<DbWriter> writer;
+    if (db) {
+        writer = std::make_unique<DbWriter>(cfg.db_connstr.c_str(),
+                                             /*pool_size=*/4,
+                                             /*batch_size=*/200,
+                                             /*flush_ms=*/50);
+        if (!writer->start()) {
+            fprintf(stderr, "[master] WARNING: DbWriter failed to start, "
+                    "falling back to synchronous writes\n");
+            writer.reset();
+        }
+    }
+
     /* ---- gRPC server ---- */
-    ClusterControlServiceImpl control_service(registry, db);
+    ClusterControlServiceImpl control_service(registry, db, writer.get());
     MasterHealthServiceImpl   health_service(registry);
 
     std::string listen_addr = "0.0.0.0:" + std::to_string(cfg.grpc_port);
@@ -247,6 +262,12 @@ int main(int argc, char* argv[])
 
     g_shutdown.store(true);  /* ensure watchdog exits */
     if (wd.joinable()) wd.join();
+
+    /* Stop async writer first (flushes remaining queue) */
+    if (writer) {
+        writer->stop();
+        writer.reset();
+    }
 
     if (db) {
         std::lock_guard<std::mutex> lk(control_service.dbMutex());

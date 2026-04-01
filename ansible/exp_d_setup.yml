@@ -1,0 +1,85 @@
+---
+# Experiment D Setup: Start cluster_master, slave_agents, metric_push
+- name: Kill old processes
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Kill cluster_master on master
+      shell: kill -9 $(pgrep cluster_master) 2>/dev/null; true
+      ignore_errors: yes
+      when: inventory_hostname == 'tianjin'
+
+    - name: Kill slave_agent on BF2s
+      shell: kill -9 $(pgrep slave_agent) 2>/dev/null; true
+      ignore_errors: yes
+      when: "'bf2' in inventory_hostname"
+
+    - name: Kill metric_push on workers
+      shell: sudo kill $(pgrep metric_push) 2>/dev/null; true
+      ignore_errors: yes
+      when: "'bf2' not in inventory_hostname"
+
+- name: Start cluster_master
+  hosts: tianjin
+  gather_facts: true
+  tasks:
+    - name: Create data dir
+      file: path=~/exp_data/D state=directory
+
+    - name: Start cluster_master
+      shell: |
+        nohup {{ exp_base }}/build/control-plane/master/cluster_master \
+          --grpc-port {{ grpc_port }} \
+          --db-connstr "{{ db_connstr }}" \
+          > ~/exp_data/D/cluster_master.log 2>&1 &
+        sleep 2
+        pgrep cluster_master
+
+- name: Start slave_agents on worker BF2s
+  hosts: fujian_bf2,helong_bf2
+  gather_facts: false
+  tasks:
+    - name: Start slave_agent
+      shell: |
+        export LD_LIBRARY_PATH=/opt/mellanox/grpc/lib:${LD_LIBRARY_PATH:-}
+        nohup ~/experiments/build/control-plane/slave/slave_agent \
+          --node-uuid={{ node_uuid }} \
+          --master-addr={{ tianjin_100g }}:{{ grpc_port }} \
+          --dev-pci={{ nic_pci }} \
+          --heartbeat-ms={{ heartbeat_ms }} \
+          > /tmp/slave_agent.log 2>&1 &
+        sleep 2
+        pgrep -f slave_agent
+      register: sa_result
+    - debug: msg="slave_agent PID={{ sa_result.stdout }}"
+
+- name: Start metric_push on worker hosts
+  hosts: workers
+  gather_facts: true
+  tasks:
+    - name: Start metric_push
+      shell: |
+        nohup {{ exp_base }}/build/bench/metric_push/metric_push \
+          --pci={{ host_pci }} \
+          --interval=1000 \
+          --node-id={{ node_id }} \
+          --master-addr={{ tianjin_100g }}:{{ grpc_port }} \
+          > ~/exp_data/D/metric_push.log 2>&1 &
+        sleep 2
+        pgrep -f metric_push
+      register: mp_result
+    - debug: msg="metric_push PID={{ mp_result.stdout }}"
+
+- name: Verify node_registry
+  hosts: tianjin
+  gather_facts: true
+  tasks:
+    - name: Wait for registrations
+      pause: seconds=10
+
+    - name: Check node_registry
+      shell: |
+        PGPASSWORD=postgres psql -h localhost -U postgres -d cluster_metrics -c \
+          "SELECT node_uuid, state, host_status, bf2_status FROM node_registry ORDER BY node_uuid;"
+      register: reg_result
+    - debug: msg="{{ reg_result.stdout }}"
