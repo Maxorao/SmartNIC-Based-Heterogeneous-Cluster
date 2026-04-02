@@ -1,110 +1,152 @@
-# Cluster Management System Design Document
+# SmartNIC-Based Heterogeneous Cluster System — Design Document
 
-Version: 2.0 (Chapter 3 redesign)
-Date: 2026-04-01
+Version: 3.0 (post-experiment, reflects deployed code)
+Date: 2026-04-02
 
-## 1. Overview
+---
 
-This document describes the redesigned cluster management system for Chapter 3
-of the thesis. The key change from Chapter 2: the SmartNIC evolves from a
-**stateless relay** (forward_routine) into an **intelligent management agent**
-(slave_agent) that handles registration, heartbeats, dual-domain monitoring,
-and fault detection.
+## 1. System Overview
 
-### Architecture Change
+This system manages heterogeneous clusters where each server is equipped with
+an NVIDIA BlueField-2 SmartNIC. The architecture spans three layers, each
+corresponding to a thesis chapter:
+
+| Layer | Chapter | Purpose | Status |
+|-------|---------|---------|--------|
+| High-speed offload tunnel | Ch.2 | PCIe kernel-bypass (Comch) between host and BF2 | **Complete** |
+| Cluster management | Ch.3 | Node lifecycle, fault recovery, state persistence | **Complete** |
+| Workload orchestration | Ch.4 | Classification + dynamic placement on SmartNIC | **Not started** |
+
+### Architecture (Chapters 2+3, deployed)
 
 ```
-Chapter 2 (tunnel layer):
-  Host metric_push → Comch → BF2 forward_routine → TCP → master_monitor
-  (BF2 is a dumb relay; no state, no protocol logic)
-
-Chapter 3 (management layer):
-  Host metric_push → Comch → BF2 slave_agent → gRPC → cluster_master
-                                    ↑ BF2 self-monitoring    ↑ primary-standby
-  Host metric_push ··fallback gRPC (direct)··→ cluster_master
-  (BF2 is the management agent; handles registration, heartbeat, fault detection)
+┌─────────── Master Node (tianjin) ──────────────────────┐
+│  Host:                                                  │
+│    cluster_master (:50051 gRPC, :8080 HTTP)             │
+│         │                                               │
+│         ├── NodeSession (bidi stream per node)          │
+│         ├── DirectPush (fallback unary RPC)             │
+│         ├── DbWriter (async batch, 4-conn pool)        │
+│         └──→ TimescaleDB (node_registry, host_metrics,  │
+│              bf2_metrics, cluster_events)               │
+│                                                         │
+│  BF2:   master_watchdog (Comch + gRPC health check)     │
+└─────────────────────────────────────────────────────────┘
+                    ▲ gRPC (100G, 192.168.56.x)
+         ┌──────────┼──────────┐
+         │          │          │
+  ┌──────┴───┐ ┌────┴─────┐
+  │fujian    │ │helong    │
+  │          │ │          │
+  │ BF2:     │ │ BF2:     │
+  │ slave_   │ │ slave_   │   ← intelligent management agent
+  │ agent    │ │ agent    │   (registration, heartbeat, dual-domain
+  │    ▲     │ │    ▲     │    monitoring, fault detection)
+  │    │Comch│ │    │Comch│
+  │ Host:    │ │ Host:    │
+  │ metric_  │ │ metric_  │   ← lightweight /proc collector
+  │ push     │ │ push     │   (Comch primary, gRPC fallback)
+  └──────────┘ └──────────┘
 ```
 
-### Comparison with Existing Systems
+### Key Design Decisions
 
-| Dimension | Kubernetes | Ceph | This System |
-|-----------|-----------|------|-------------|
-| Agent location | kubelet on host | OSD on host | slave_agent on SmartNIC |
-| Heartbeat | Lease object (10s) | OSD peer (6s) | gRPC stream (3s) |
-| Fault detection | 40s grace + 5min eviction | 20s grace + Reporter | 15s suspect + 45s offline |
-| Heterogeneous | Device Plugin (passive) | Device Class | Native dual-domain monitoring |
-| Degradation | Node-level NotReady | OSD-level down | Per-domain + fallback channel |
-| Host CPU impact | kubelet consumes CPU | OSD consumes CPU | Zero host CPU for management |
+1. **Management agent on BF2, not host** — zero host CPU interference,
+   native dual-domain visibility, independent fault detection
+2. **gRPC replaces raw TCP** — built-in keepalive, bidirectional streaming,
+   protobuf serialization, instant stream-close detection
+3. **Async batch DB writer** — decouples gRPC latency from DB writes,
+   3.8x throughput improvement at 256 nodes
+4. **Comch→gRPC fallback** — metric_push auto-switches transport when
+   SmartNIC fails, zero metric data loss
+
+---
 
 ## 2. Components
 
-### 2.1 cluster_master (Master Host)
+### 2.1 cluster_master
 
-gRPC C++ server replacing the legacy master_monitor.
+**Location:** Master host (tianjin)
+**Binary:** `build/control-plane/master/cluster_master`
+**Source:** `cluster_master.cc` (280 lines)
 
-**Responsibilities:**
-- Node registry with state machine (Online/Suspect/Offline)
-- Heartbeat monitoring with configurable thresholds
-- Metric aggregation → TimescaleDB (host_metrics, bf2_metrics tables)
-- Self-monitoring (CPU, memory, disk)
-- HTTP JSON status endpoint (port 8080)
-- Event logging to cluster_events table
+gRPC C++ server. Entry point creates NodeRegistry, connects to TimescaleDB,
+starts DbWriter (4-connection pool), registers gRPC services, spawns watchdog
+thread (1s state transition sweep), HTTP status server, and signal handler.
 
 **gRPC Services:**
-- `ClusterControl.NodeSession` — bidirectional stream for slave_agents
+- `ClusterControl.NodeSession` — bidi stream per slave_agent
 - `ClusterControl.DirectPush` — unary RPC for metric_push fallback
-- `MasterHealth.Ping` — health check for master_watchdog
+- `MasterHealth.Ping` — health probe for master_watchdog
 
-### 2.2 slave_agent (Worker BF2)
+**Key runtime components:**
+- `NodeRegistry` (node_registry.{h,cc}, 333 lines) — thread-safe
+  `unordered_map<uuid, NodeEntry>`, state machine transitions with
+  lock-free callback dispatch
+- `DbWriter` (db_writer.{h,cc}, 493 lines) — spinlock MPSC queue,
+  vector-swap drain, multi-row INSERT batching, 4-connection pool
+- `grpc_service` (grpc_service.{h,cc}, 438 lines) — NodeSession handler
+  with ACK-before-DB pattern, db_mu_ mutex for sync DB calls
+- `db` (db.{h,cc}, 641 lines) — libpq wrapper with auto-reconnect,
+  schema v2 (4 tables), parameterized queries
 
-Intelligent management agent running on each worker's BF2 ARM processor.
+### 2.2 slave_agent
 
-**Responsibilities:**
-- Register with cluster_master using BF2 hardware UUID
-- Receive host metrics from metric_push via Comch (PCIe kernel-bypass)
-- Collect BF2 metrics locally (/proc/stat, thermal, network stats, OVS)
-- Send heartbeats with dual-domain status (host_status + bf2_status)
-- Detect host failure (Comch timeout → host_status=UNREACHABLE)
-- Auto-reconnect to master with exponential backoff
+**Location:** Worker BF2 ARM (fujian, helong)
+**Binary:** `build/control-plane/slave/slave_agent`
+**Source:** `slave_agent.cc` (585 lines)
 
-**Key design decision:** slave_agent runs on BF2 (not host) because:
-1. Zero host CPU interference (consistent with Chapter 2 thesis)
-2. Native dual-domain visibility (host via Comch + BF2 local)
-3. Independent fault detection (BF2 detects host Comch timeout)
-4. Single process replaces forward_routine + slave_monitor
+Core innovation: SmartNIC is the management agent, not a relay.
 
-### 2.3 metric_push (Worker Host)
+**Sub-components:**
+- `HostCollector` (host_collector.{h,cc}, 306 lines) — Comch NIC-side
+  receiver thread, parses binary protocol.h messages from metric_push,
+  exposes thread-safe `getLatest()` and `isAlive()`
+- `BF2Collector` (bf2_collector.{h,cc}, 208 lines) — reads local
+  /proc/stat, /proc/meminfo, /sys/class/thermal, /sys/class/net/p0,
+  `ovs-dpctl dump-flows`
 
-Lightweight metric collector, same as Chapter 2 with added fallback.
+**Main loop:** register → heartbeat/report cycle with three independent
+timers (heartbeat 3s, host report 3s, BF2 report 5s) → StatusChangeNotice
+on domain transitions → exponential backoff reconnect on failure.
 
-**Normal mode (Comch):** Read /proc, send binary message via Comch to BF2.
-~65us per iteration, negligible CPU impact.
+### 2.3 metric_push
 
-**Fallback mode (gRPC direct):** When Comch fails 5 consecutive times,
-auto-switch to direct gRPC call to cluster_master. Periodically attempt
-Comch recovery. Switch back when Comch recovers.
+**Location:** Worker host (fujian, helong)
+**Binary:** `build/bench/metric_push/metric_push`
+**Source:** `metric_push.cc` (299 lines)
 
-### 2.4 master_watchdog (Master BF2)
+Dual-mode metric collector:
+- **Comch mode:** read /proc → build binary msg → comch_host_send() (~65µs)
+- **gRPC mode:** read /proc → build protobuf → DirectPush() unary RPC
+- Auto-switch after 5 consecutive Comch failures; retry Comch every 30s
 
-Monitors cluster_master process health from the master's own BF2.
+### 2.4 master_watchdog
 
-**Detection:** Comch health pings + gRPC Health check, every 3s.
-**Recovery:** Auto-restart cluster_master (3 retries). If all fail,
-signal standby node via gRPC FailoverControl.
+**Location:** Master BF2 ARM (tianjin)
+**Binary:** `build/control-plane/watchdog/master_watchdog`
+**Source:** `master_watchdog.cc` (306 lines)
 
-### 2.5 TimescaleDB (Master Host)
+Dual-channel health monitor:
+- Comch: MSG_HEARTBEAT to cluster_master, 5 failures = unhealthy
+- gRPC: MasterHealth.Ping(), 10 failures = failed
+- Recovery: `systemctl restart cluster_master` (3 retries)
 
-Time-series database for cluster state persistence.
+### 2.5 mock_slave
 
-**Tables:**
-- `node_registry` — current node state (relational, non-time-series)
-- `host_metrics` — host CPU/memory/network hypertable
-- `bf2_metrics` — BF2 ARM CPU/temp/port stats hypertable
-- `cluster_events` — audit log hypertable
+**Location:** Any host (test tool)
+**Binary:** `build/bench/mock_slave/mock_slave`
+**Source:** `mock_slave.cc` (372 lines)
+
+Scalability test: N threads, each opens NodeSession bidi stream,
+sends heartbeat + ResourceReport at configurable interval. Measures
+registration latency, report-to-ACK latency, errors.
+
+---
 
 ## 3. Communication Protocols
 
-### 3.1 Host ↔ BF2: Comch Binary Protocol (unchanged from Chapter 2)
+### 3.1 Host ↔ BF2: Binary over Comch (Chapter 2)
 
 ```
 ┌──────────┬──────────┬──────────┬──────────┐
@@ -115,222 +157,187 @@ Time-series database for cluster state persistence.
 │           Payload (0-4064 bytes)           │
 └────────────────────────────────────────────┘
 Magic = 0xBEEF1234
-Types: REGISTER(1), HEARTBEAT(3), RESOURCE_REPORT(5), etc.
-Max message: 4080 bytes (Comch hardware limit)
+Max message: 4080 bytes (BF2 DOCA 1.5 hardware limit)
 ```
 
-### 3.2 BF2 ↔ Master: gRPC over TCP/100G (new)
+Message types: REGISTER(1), REGISTER_ACK(2), HEARTBEAT(3),
+HEARTBEAT_ACK(4), RESOURCE_REPORT(5), COMMAND(6), COMMAND_ACK(7),
+DEREGISTER(8), BF2_REPORT(9), STATUS_CHANGE(10), DEREGISTER_NOTICE(11).
 
-Uses Protocol Buffers + HTTP/2 bidirectional streaming.
+### 3.2 BF2 ↔ Master: gRPC over TCP/100G (Chapter 3)
 
-**NodeSession flow:**
+Defined in `proto/cluster.proto` (240 lines). Key services:
+
+```protobuf
+service ClusterControl {
+  rpc NodeSession(stream NodeMessage) returns (stream MasterMessage);
+  rpc DirectPush(DirectPushRequest) returns (DirectPushResponse);
+}
+service MasterHealth {
+  rpc Ping(HealthPingRequest) returns (HealthPingResponse);
+}
+service FailoverControl {
+  rpc TriggerFailover(FailoverRequest) returns (FailoverResponse);
+}
+```
+
+**NodeSession message flow:**
 ```
 slave_agent                          cluster_master
-    │                                      │
     │──── RegisterRequest ────────────────>│
     │<─── RegisterAck ────────────────────│
     │                                      │
-    │──── HeartbeatPing ──────────────────>│
+    │──── HeartbeatPing ──────────────────>│  (every 3s)
     │<─── HeartbeatAck ───────────────────│
-    │                                      │
-    │──── ResourceReport (host metrics) ──>│
+    │──── ResourceReport ─────────────────>│  (every 3s)
     │<─── ReportAck ──────────────────────│
-    │                                      │
-    │──── BF2MetricsReport ───────────────>│
-    │                                      │
-    │──── StatusChangeNotice ─────────────>│  (host_status changed)
-    │                                      │
-    │<─── NodeCommand ────────────────────│  (admin command)
-    │──── CommandResult ──────────────────>│
-    │                                      │
-    │──── DeregisterNotice ───────────────>│
-    │                                      │
+    │──── BF2MetricsReport ───────────────>│  (every 5s)
+    │──── StatusChangeNotice ─────────────>│  (on domain change)
+    │──── DeregisterNotice ───────────────>│  (graceful shutdown)
 ```
 
-**gRPC Keepalive Configuration:**
-- Client: KEEPALIVE_TIME=10s, KEEPALIVE_TIMEOUT=5s, PERMIT_WITHOUT_CALLS=true
-- Server: MIN_RECV_PING_INTERVAL=5s, MAX_PING_STRIKES=2
+**Keepalive:** Client KEEPALIVE_TIME=10s, TIMEOUT=5s; Server
+MIN_RECV_PING_INTERVAL=5s.
+
+---
 
 ## 4. Node State Machine
 
 ```
-                     register(uuid)
-   ┌──────────────┐ ──────────────> ┌──────────┐
-   │ Unregistered  │                 │  Online   │◄──────────┐
-   └──────────────┘                  └──────────┘            │
-                                          │                  │
-                              no heartbeat│                  │ heartbeat
-                              for 15s     │                  │ received
-                                          ▼                  │
-                                     ┌──────────┐           │
-                                     │ Suspect   │───────────┘
-                                     └──────────┘
-                                          │
-                              no heartbeat│
-                              for 45s     │
-                                          ▼
-                                     ┌──────────┐  re-register
-                                     │ Offline   │────────────> Online
-                                     └──────────┘  (same uuid)
+Unregistered ──register(uuid)──> Online ◄──heartbeat──┐
+                                   │                   │
+                         no HB 15s │                   │
+                                   ▼                   │
+                                Suspect ───────────────┘
+                                   │
+                         no HB 45s │
+                                   ▼
+                                Offline ──re-register──> Online
+                                           (same uuid)
 ```
 
-**Parameters:**
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| heartbeat_interval | 3s | Dedicated 100G network, stable latency |
-| suspect_threshold | 15s (5x) | Fast detection, low false positive rate |
-| offline_threshold | 45s (15x) | Confirmed failure, trigger recovery |
-| check_period | 1s | Master polling frequency |
+**Dual-domain status:** Each node has independent `host_status` (OK /
+Degraded / Unreachable) and `bf2_status` (OK / Degraded / Offline),
+enabling fine-grained fault diagnosis beyond K8s's single Ready/NotReady.
 
-**Dual-domain status (unique to this system):**
+---
 
-| node_state | host_domain | bf2_domain | Meaning |
-|------------|-------------|------------|---------|
-| Online | OK | OK | Normal operation |
-| Online | Unreachable | OK | PCIe/Comch fault, BF2 still reporting |
-| Online | OK | Degraded | BF2 thermal/resource pressure |
-| Suspect | - | - | Full node heartbeat timeout |
-| Offline | - | Offline | Confirmed node failure |
-| Online | OK | N/A | Degraded mode: metric_push direct to master |
+## 5. Fault Recovery (Validated by Experiment D)
 
-## 5. Fault Recovery
+| Scenario | Detection | Recovery | Validated |
+|----------|-----------|----------|-----------|
+| slave_agent crash | 2.5s (gRPC stream close) | 6.9s total | 5 runs, σ=160ms |
+| Comch/PCIe failure | 5.3s (metric_push fallback) | 9.6s Comch restore | 5 runs |
+| cluster_master crash | 2.0s (restart) | 3.1s full reconnect | 5 runs, σ<2ms |
+| Full node power loss | 45s (offline threshold) | re-register on boot | by design |
+| 100G network partition | immediate TCP disconnect | exp. backoff 3-30s | by design |
 
-### Scenario 1: slave_agent crash (BF2 process dies)
-- Detection: 15s (suspect_threshold)
-- Recovery: systemd restart → re-register with same UUID → Online
-- Total: ~5s (restart + register)
+---
 
-### Scenario 2: Comch/PCIe link failure
-- Detection: 3s (slave_agent Comch timeout)
-- Action: slave_agent reports host_status=UNREACHABLE
-- Fallback: metric_push switches to direct gRPC (~4s)
-- Control plane interruption: ~4s
+## 6. Database Schema & Performance (Validated by Experiment E)
 
-### Scenario 3: Full node failure (power loss)
-- Detection: 45s (offline_threshold)
-- BF2 powered via PCIe → also loses power
-- Recovery: on reboot, slave_agent re-registers
+**Tables:** node_registry (relational), host_metrics (hypertable),
+bf2_metrics (hypertable), cluster_events (hypertable).
 
-### Scenario 4: 100G network partition
-- Detection: slave_agent detects TCP disconnect immediately
-- Action: exponential backoff reconnection (3s, 6s, 12s, max 30s)
-- Buffer: up to 100 heartbeats locally (~5 minutes)
-- Fallback: try 1G management network if available
+**Write performance (async batch writer):**
 
-### Scenario 5: cluster_master crash
-- Detection: master_watchdog (Comch + gRPC) within 3-15s
-- Recovery: watchdog restarts master (3 retries)
-- If hardware failure: failover to standby node
-- slave_agents: reconnect with exponential backoff
+| Nodes | Sync (rows/s) | Async (rows/s) | Improvement | Latency |
+|-------|---------------|----------------|-------------|---------|
+| 64 | 44 | 60 | 1.4x | 10.1ms |
+| 128 | 51 | 118 | 2.3x | 10.1ms |
+| 256 | 60 | 227 | 3.8x | 11.0ms |
 
-## 6. Database Schema
+**Query performance:** Status query 5.9ms, 5-min aggregation 10.8ms,
+1-hour time_bucket 13.1ms. Compression ratio: 4.6:1.
 
-```sql
--- Node registry (mutable state, non-time-series)
-CREATE TABLE IF NOT EXISTS node_registry (
-    node_uuid    TEXT PRIMARY KEY,
-    hostname     TEXT NOT NULL,
-    pci_bus_id   TEXT,
-    state        TEXT NOT NULL DEFAULT 'offline',
-    host_status  TEXT DEFAULT 'unknown',
-    bf2_status   TEXT DEFAULT 'unknown',
-    registered_at TIMESTAMPTZ DEFAULT NOW(),
-    last_seen    TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Host metrics (time-series hypertable)
-CREATE TABLE IF NOT EXISTS host_metrics (
-    time         TIMESTAMPTZ NOT NULL,
-    node_uuid    TEXT NOT NULL,
-    cpu_pct      REAL,
-    mem_total_kb BIGINT,
-    mem_avail_kb BIGINT,
-    net_rx_bytes BIGINT,
-    net_tx_bytes BIGINT
-);
-SELECT create_hypertable('host_metrics', 'time', if_not_exists => TRUE);
-
--- BF2 metrics (time-series hypertable)
-CREATE TABLE IF NOT EXISTS bf2_metrics (
-    time           TIMESTAMPTZ NOT NULL,
-    node_uuid      TEXT NOT NULL,
-    arm_cpu_pct    REAL,
-    arm_mem_total_kb BIGINT,
-    arm_mem_avail_kb BIGINT,
-    temperature_c  REAL,
-    port_rx_bytes  BIGINT,
-    port_tx_bytes  BIGINT,
-    port_rx_drops  BIGINT,
-    ovs_flow_count INT
-);
-SELECT create_hypertable('bf2_metrics', 'time', if_not_exists => TRUE);
-
--- Cluster events (audit log hypertable)
-CREATE TABLE IF NOT EXISTS cluster_events (
-    time       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    node_uuid  TEXT,
-    event_type TEXT NOT NULL,
-    detail     TEXT
-);
-SELECT create_hypertable('cluster_events', 'time', if_not_exists => TRUE);
-
--- Compression policies (>1 day)
-SELECT add_compression_policy('host_metrics', INTERVAL '7 days');
-SELECT add_compression_policy('bf2_metrics', INTERVAL '7 days');
-
--- Retention policies (>90 days)
-SELECT add_retention_policy('host_metrics', INTERVAL '90 days');
-SELECT add_retention_policy('bf2_metrics', INTERVAL '90 days');
-SELECT add_retention_policy('cluster_events', INTERVAL '90 days');
-```
+---
 
 ## 7. Build System
 
-CMake-based build replacing per-directory Makefiles (legacy Makefiles preserved).
+CMake with `-DBUILD_TARGET=HOST|BF2` flag:
 
-```
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+```bash
+# Host (x86): cluster_master, metric_push, mock_slave
+cmake -B build -DBUILD_TARGET=HOST -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# On BF2 ARM (native compilation):
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOMCH_NIC_DOCA_VER=15
-cmake --build build --target slave_agent master_watchdog
+# BF2 (ARM): slave_agent, master_watchdog
+cmake -B build -DBUILD_TARGET=BF2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-**Dependencies:**
-- gRPC++ (libgrpc++-dev) — both x86 and aarch64
-- protobuf (libprotobuf-dev) — both architectures
-- PostgreSQL (libpq-dev) — master only
-- DOCA SDK — conditional, for Comch-enabled builds
+**Dependencies:** gRPC++ (libgrpc++-dev), protobuf, PostgreSQL (libpq-dev,
+host only), DOCA SDK (Comch).
 
-## 8. Deployment
+Comch static library (`comch_c`) is built from `tunnel/host/comch_host.c`
+(HOST) or `tunnel/nic/comch_nic.c` (BF2) with version-appropriate DOCA
+linking (3.1 libdoca_comch for host, 1.5 libdoca_comm_channel for BF2).
+
+---
+
+## 8. File Inventory (current, 2026-04-02)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `proto/cluster.proto` | 240 | gRPC service + message definitions |
+| `common/node_state.h` | 109 | State machine enums + transitions |
+| `common/protocol.h` | 167 | Binary Comch protocol (Ch.2) |
+| `common/timing.h` | — | Nanosecond timing utilities (Ch.2) |
+| `CMakeLists.txt` | 157 | Top-level build (BUILD_TARGET, DOCA, gRPC) |
+| `proto/CMakeLists.txt` | 57 | Protobuf/gRPC code generation |
+| **cluster_master** | | |
+| `cluster_master.cc` | 280 | Main entry point |
+| `grpc_service.{h,cc}` | 438 | NodeSession + DirectPush + Health |
+| `node_registry.{h,cc}` | 333 | Thread-safe node state management |
+| `db_writer.{h,cc}` | 493 | Async batch writer (spinlock + pool) |
+| `db.{h,cc}` | 641 | libpq wrapper, schema v2 |
+| `http_status.{h,cc}` | 192 | HTTP JSON status server |
+| **slave_agent** | | |
+| `slave_agent.cc` | 585 | BF2 management agent main |
+| `bf2_collector.{h,cc}` | 208 | Local ARM metric collection |
+| `host_collector.{h,cc}` | 306 | Comch receiver for host metrics |
+| **auxiliary** | | |
+| `master_watchdog.cc` | 306 | Master health monitor (BF2) |
+| `metric_push.cc` | 299 | Host collector + gRPC fallback |
+| `mock_slave.cc` | 372 | Scalability test tool |
+| **Total** | **~5,200** | |
+
+---
+
+## 9. Deployment Topology
 
 ```
-Master (tianjin):
-  Host:  cluster_master --grpc-port=50051 --http-port=8080 --db-connstr=...
-  BF2:   master_watchdog --master-grpc-addr=192.168.100.1:50051
-
-Worker (fujian, helong):
-  Host:  metric_push --pci=0000:5e:00.0 --master-addr=192.168.56.10:50051
-  BF2:   slave_agent --node-uuid=<auto> --master-addr=192.168.56.10:50051
+                172.28.4.x management LAN (eno1, 1G)
+    ┌─────────────────┬─────────────────┬─────────────────┐
+    │  tianjin .75    │  fujian .77     │  helong .85     │
+    │  MASTER         │  WORKER         │  WORKER         │
+    │  cluster_master │  metric_push    │  metric_push    │
+    │  TimescaleDB    │                 │                 │
+    │                 │                 │                 │
+    │  BF2: watchdog  │  BF2: slave_    │  BF2: slave_    │
+    │       (.56.2)   │  agent (.56.3)  │  agent (.56.1)  │
+    └────────┬────────┘────────┬────────┘────────┬────────┘
+             └─────────────────┴─────────────────┘
+                  192.168.56.0/24 (100G switch)
 ```
 
-## 9. File Inventory
+---
 
-| File | Language | Lines | Purpose |
-|------|----------|-------|---------|
-| proto/cluster.proto | Protobuf | 190 | Service + message definitions |
-| common/node_state.h | C | 95 | State machine + domain types |
-| CMakeLists.txt | CMake | 65 | Top-level build |
-| proto/CMakeLists.txt | CMake | 30 | Proto code generation |
-| control-plane/master/cluster_master.cc | C++ | 250 | Master entry point |
-| control-plane/master/grpc_service.{h,cc} | C++ | 260 | gRPC service impl |
-| control-plane/master/node_registry.{h,cc} | C++ | 240 | Node state management |
-| control-plane/master/http_status.{h,cc} | C++ | 145 | HTTP JSON status |
-| control-plane/master/db.{h,cc} | C/C++ | 450 | TimescaleDB interface |
-| control-plane/slave/slave_agent.cc | C++ | 350 | BF2 agent entry point |
-| control-plane/slave/bf2_collector.{h,cc} | C++ | 225 | BF2 metric collection |
-| control-plane/slave/host_collector.{h,cc} | C++ | 160 | Comch host metric proxy |
-| control-plane/watchdog/master_watchdog.cc | C++ | 200 | Master health monitor |
-| bench/metric_push/metric_push.cc | C++ | 200 | Host metric push + fallback |
-| bench/mock_slave/mock_slave.cc | C++ | 250 | Scalability testing |
+## 10. Chapter 4 — Workload Orchestration (TODO)
+
+### Not yet implemented. Planned components:
+
+1. **Workload classifier** — rule-based or ML model to categorize
+   workloads as I/O-intensive, compute-intensive, or lightweight
+2. **Scheduling engine** — queries cluster_master's TimescaleDB for
+   real-time metrics, decides placement (host vs BF2)
+3. **Migration trigger** — monitors LLC miss rate and memory bandwidth,
+   triggers container migration when interference threshold exceeded
+4. **BF2 container runtime** — lightweight container environment on
+   BF2 ARM for running Nginx, PostgreSQL, FaaS functions
+
+### Planned experiments (F-I):
+- F: Workload feature profiling (x86 vs ARM performance comparison)
+- G: Interference quantification (GEMM + Nginx co-location)
+- H: SmartNIC workload execution performance
+- I: Orchestration strategy comparison (static vs dynamic)

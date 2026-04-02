@@ -143,3 +143,15 @@ mkdir -p "${DATA_DIR}"/{D,E,F} 2>/dev/null
 HEARTBEAT_INTERVAL_MS=3000
 SUSPECT_THRESHOLD_S=15
 OFFLINE_THRESHOLD_S=45
+
+# ---------------------------------------------------------------
+# Chapter 4: Workload orchestration
+# ---------------------------------------------------------------
+mkdir -p "${DATA_DIR}"/{ch4_F,ch4_G,ch4_H,ch4_I} 2>/dev/null
+
+# Orchestrator
+ORCHESTRATOR="${EXP_BASE}/control-plane/orchestrator/orchestrator.py"
+
+# Floating VIPs for migratable workloads
+VIP_FUJIAN="192.168.56.200"
+VIP_HELONG="192.168.56.201"
