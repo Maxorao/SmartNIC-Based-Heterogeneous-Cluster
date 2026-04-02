@@ -945,14 +945,496 @@ echo "Cleanup done"
 
 ---
 
-## 9. Data Collection Summary
+## 9. Setup: BF2 Docker Environment (Chapter 4 prerequisite)
 
-After all experiments complete, run this to collect all results:
+```bash
+source ~/experiments/scripts/config.sh
+
+# Install Docker on all BF2s and pull Nginx arm64 image
+bash ~/experiments/scripts/setup_bf2_docker.sh
+
+# Install wrk on tianjin (load generator)
+sudo apt-get install -y -qq wrk 2>/dev/null || \
+  (git clone https://github.com/wg/wrk.git /tmp/wrk && cd /tmp/wrk && make -j$(nproc) && sudo cp wrk /usr/local/bin/)
+
+# Install Python deps for orchestrator on tianjin
+pip3 install -q psycopg2-binary
+```
+
+**Verify:**
+```bash
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'docker images nginx:alpine --format \"{{.Repository}}:{{.Tag}}\"'"
+which wrk && echo "wrk OK"
+python3 -c "import psycopg2; print('psycopg2 OK')"
+```
+
+---
+
+## 10. Experiment G — Workload Feature Profiling (Chapter 4)
+
+Measures Nginx and DGEMM characteristics on x86 host vs BF2 ARM.
+Collects: CPU%, LLC miss rate, network I/O, context switches, req/s, GFLOPS.
+
+### 10a. Nginx on x86 host
+
+```bash
+source ~/experiments/scripts/config.sh
+mkdir -p ~/exp_data/ch4_G
+
+# Start Nginx on fujian host
+ssh $(whoami)@172.28.4.77 "
+  docker rm -f nginx-profile 2>/dev/null
+  docker run -d --name nginx-profile --network=host nginx:alpine
+  sleep 3
+"
+
+# Run wrk from tianjin (30s, 100 connections)
+wrk -t4 -c100 -d30s "http://${FUJIAN_100G}/" 2>&1 | tee ~/exp_data/ch4_G/wrk_nginx_x86.txt
+
+# Collect perf stat on fujian during a second wrk run
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches -a \
+    -o /tmp/perf_nginx_x86.txt sleep 30 &
+  PERF_PID=\$!
+  sleep 30
+  wait \${PERF_PID}
+" &
+
+wrk -t4 -c100 -d30s "http://${FUJIAN_100G}/" > /dev/null 2>&1
+wait
+
+scp $(whoami)@172.28.4.77:/tmp/perf_nginx_x86.txt ~/exp_data/ch4_G/
+ssh $(whoami)@172.28.4.77 "docker rm -f nginx-profile"
+
+echo "=== Nginx x86 Results ==="
+cat ~/exp_data/ch4_G/wrk_nginx_x86.txt
+echo ""
+cat ~/exp_data/ch4_G/perf_nginx_x86.txt
+```
+
+### 10b. Nginx on BF2 ARM
+
+```bash
+# Start Nginx on fujian BF2
+ssh $(whoami)@172.28.4.77 "
+  ssh root@192.168.100.2 '
+    docker rm -f nginx-profile 2>/dev/null
+    docker run -d --name nginx-profile --network=host nginx:alpine
+    sleep 3
+  '
+"
+
+# Run wrk against BF2 IP
+wrk -t4 -c100 -d30s "http://${FUJIAN_BF2_FABRIC}/" 2>&1 | tee ~/exp_data/ch4_G/wrk_nginx_bf2.txt
+
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'docker rm -f nginx-profile'"
+
+echo "=== Nginx BF2 Results ==="
+cat ~/exp_data/ch4_G/wrk_nginx_bf2.txt
+```
+
+### 10c. DGEMM on x86 host (with perf stat)
+
+```bash
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_gemm_x86.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=30 \
+    > /tmp/gemm_x86.txt 2>&1
+"
+scp $(whoami)@172.28.4.77:/tmp/gemm_x86.txt ~/exp_data/ch4_G/
+scp $(whoami)@172.28.4.77:/tmp/perf_gemm_x86.txt ~/exp_data/ch4_G/
+
+echo "=== DGEMM x86 Results ==="
+tail -5 ~/exp_data/ch4_G/gemm_x86.txt
+cat ~/exp_data/ch4_G/perf_gemm_x86.txt
+```
+
+---
+
+## 11. Experiment H — Co-location Interference (Chapter 4)
+
+Measures DGEMM throughput + LLC miss rate under three scenarios.
+Compare with Experiment B (Ch.2): interference source = monitoring agents (5.3%).
+This experiment: interference source = Nginx (expected > 5.3%).
+
+### 11a. Scenario 1 — DGEMM baseline (no co-location)
+
+```bash
+source ~/experiments/scripts/config.sh
+mkdir -p ~/exp_data/ch4_H
+
+# Ensure no Nginx running
+ssh $(whoami)@172.28.4.77 "docker rm -f nginx-exp 2>/dev/null" || true
+
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_s1.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
+    > /tmp/gemm_s1.txt 2>&1
+"
+scp $(whoami)@172.28.4.77:/tmp/gemm_s1.txt ~/exp_data/ch4_H/
+scp $(whoami)@172.28.4.77:/tmp/perf_s1.txt ~/exp_data/ch4_H/
+
+echo "=== Scenario 1: DGEMM baseline ==="
+tail -3 ~/exp_data/ch4_H/gemm_s1.txt
+grep -E "LLC|context" ~/exp_data/ch4_H/perf_s1.txt
+```
+
+### 11b. Scenario 2 — DGEMM + Nginx co-located (interference)
+
+```bash
+# Start Nginx on fujian host, pinned to same NUMA node as DGEMM
+ssh $(whoami)@172.28.4.77 "
+  docker rm -f nginx-exp 2>/dev/null
+  docker run -d --name nginx-exp --network=host --cpuset-cpus=0-15 nginx:alpine
+  sleep 3
+"
+
+# Start sustained wrk load in background (from tianjin)
+wrk -t4 -c200 -d60s "http://${FUJIAN_100G}/" > ~/exp_data/ch4_H/wrk_s2.txt 2>&1 &
+WRK_PID=$!
+
+# Run DGEMM with perf stat (concurrent with wrk)
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_s2.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
+    > /tmp/gemm_s2.txt 2>&1
+"
+
+wait ${WRK_PID} 2>/dev/null
+scp $(whoami)@172.28.4.77:/tmp/gemm_s2.txt ~/exp_data/ch4_H/
+scp $(whoami)@172.28.4.77:/tmp/perf_s2.txt ~/exp_data/ch4_H/
+
+echo "=== Scenario 2: DGEMM + Nginx co-located ==="
+tail -3 ~/exp_data/ch4_H/gemm_s2.txt
+grep -E "LLC|context" ~/exp_data/ch4_H/perf_s2.txt
+echo "Nginx wrk:"
+grep "Requests/sec" ~/exp_data/ch4_H/wrk_s2.txt
+
+ssh $(whoami)@172.28.4.77 "docker rm -f nginx-exp"
+```
+
+### 11c. Scenario 3 — Nginx migrated to BF2 (after orchestration)
+
+```bash
+# Start Nginx on fujian BF2
+ssh $(whoami)@172.28.4.77 "
+  ssh root@192.168.100.2 '
+    docker rm -f nginx-exp 2>/dev/null
+    docker run -d --name nginx-exp --network=host nginx:alpine
+    sleep 3
+  '
+"
+
+# Start sustained wrk against BF2 Nginx
+wrk -t4 -c200 -d60s "http://${FUJIAN_BF2_FABRIC}/" > ~/exp_data/ch4_H/wrk_s3.txt 2>&1 &
+WRK_PID=$!
+
+# Run DGEMM on host (no Nginx interference)
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_s3.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
+    > /tmp/gemm_s3.txt 2>&1
+"
+
+wait ${WRK_PID} 2>/dev/null
+scp $(whoami)@172.28.4.77:/tmp/gemm_s3.txt ~/exp_data/ch4_H/
+scp $(whoami)@172.28.4.77:/tmp/perf_s3.txt ~/exp_data/ch4_H/
+
+echo "=== Scenario 3: DGEMM alone, Nginx on BF2 ==="
+tail -3 ~/exp_data/ch4_H/gemm_s3.txt
+grep -E "LLC|context" ~/exp_data/ch4_H/perf_s3.txt
+echo "BF2 Nginx wrk:"
+grep "Requests/sec" ~/exp_data/ch4_H/wrk_s3.txt
+
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'docker rm -f nginx-exp'"
+
+echo ""
+echo "=== Experiment H Summary ==="
+for s in 1 2 3; do
+  f=~/exp_data/ch4_H/gemm_s${s}.txt
+  if [ -f "$f" ]; then
+    avg=$(awk 'NR>5 {s+=$1; n++} END{if(n>0) printf "%.1f", s/n}' "$f")
+    echo "  Scenario ${s}: avg GFLOPS = ${avg}"
+  fi
+done
+echo "Compare with Exp B Scenario 2 (monitoring agents): 383.7 GFLOPS (-5.3%)"
+```
+
+---
+
+## 12. Experiment I — BF2 Nginx Performance (Chapter 4)
+
+Measures Nginx throughput on BF2 ARM at multiple concurrency levels,
+as reference data for workload placement decisions.
+
+```bash
+source ~/experiments/scripts/config.sh
+mkdir -p ~/exp_data/ch4_I
+
+CONCURRENCIES="10 50 100 200 400"
+
+# --- Nginx on x86 host ---
+echo "=== Nginx on x86 host ==="
+ssh $(whoami)@172.28.4.77 "
+  docker rm -f nginx-bench 2>/dev/null
+  docker run -d --name nginx-bench --network=host nginx:alpine
+  sleep 3
+"
+
+echo "conns,req_per_sec,avg_latency,transfer" > ~/exp_data/ch4_I/nginx_x86.csv
+for c in ${CONCURRENCIES}; do
+  result=$(wrk -t4 -c${c} -d30s "http://${FUJIAN_100G}/" 2>&1)
+  rps=$(echo "$result" | grep "Requests/sec" | awk '{print $2}')
+  lat=$(echo "$result" | grep "Latency" | awk '{print $2}')
+  xfer=$(echo "$result" | grep "Transfer/sec" | awk '{print $2}')
+  echo "  c=${c}: ${rps} req/s, ${lat} latency"
+  echo "${c},${rps},${lat},${xfer}" >> ~/exp_data/ch4_I/nginx_x86.csv
+done
+ssh $(whoami)@172.28.4.77 "docker rm -f nginx-bench"
+
+# --- Nginx on BF2 ARM ---
+echo ""
+echo "=== Nginx on BF2 ARM ==="
+ssh $(whoami)@172.28.4.77 "
+  ssh root@192.168.100.2 '
+    docker rm -f nginx-bench 2>/dev/null
+    docker run -d --name nginx-bench --network=host nginx:alpine
+    sleep 3
+  '
+"
+
+echo "conns,req_per_sec,avg_latency,transfer" > ~/exp_data/ch4_I/nginx_bf2.csv
+for c in ${CONCURRENCIES}; do
+  result=$(wrk -t4 -c${c} -d30s "http://${FUJIAN_BF2_FABRIC}/" 2>&1)
+  rps=$(echo "$result" | grep "Requests/sec" | awk '{print $2}')
+  lat=$(echo "$result" | grep "Latency" | awk '{print $2}')
+  xfer=$(echo "$result" | grep "Transfer/sec" | awk '{print $2}')
+  echo "  c=${c}: ${rps} req/s, ${lat} latency"
+  echo "${c},${rps},${lat},${xfer}" >> ~/exp_data/ch4_I/nginx_bf2.csv
+done
+ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'docker rm -f nginx-bench'"
+
+echo ""
+echo "=== Experiment I Results ==="
+echo "--- x86 ---"
+cat ~/exp_data/ch4_I/nginx_x86.csv
+echo ""
+echo "--- BF2 ---"
+cat ~/exp_data/ch4_I/nginx_bf2.csv
+```
+
+---
+
+## 13. Experiment J — Orchestration Strategy (Chapter 4)
+
+Compares cluster performance with/without workload orchestration,
+and measures blue-green migration overhead with VIP switch.
+
+### 13a. Scenario 1 — No orchestration (Nginx + DGEMM on host)
+
+```bash
+source ~/experiments/scripts/config.sh
+mkdir -p ~/exp_data/ch4_J
+VIP="${VIP_FUJIAN}"
+HOST_IFACE="enp94s0f1np1"
+BF2_IFACE="p1"
+
+# Assign VIP to host, start Nginx pinned to NUMA 0
+ssh $(whoami)@172.28.4.77 "
+  sudo ip addr add ${VIP}/24 dev ${HOST_IFACE} 2>/dev/null || true
+  docker rm -f nginx-exp 2>/dev/null
+  docker run -d --name nginx-exp --network=host --cpuset-cpus=0-15 nginx:alpine
+  sleep 3
+"
+
+# Start wrk against VIP (60s sustained load)
+wrk -t4 -c200 -d60s "http://${VIP}/" > ~/exp_data/ch4_J/wrk_s1.txt 2>&1 &
+WRK_PID=$!
+
+# Run DGEMM
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_orch_s1.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
+    > /tmp/gemm_orch_s1.txt 2>&1
+"
+
+wait ${WRK_PID} 2>/dev/null
+scp $(whoami)@172.28.4.77:/tmp/gemm_orch_s1.txt ~/exp_data/ch4_J/
+scp $(whoami)@172.28.4.77:/tmp/perf_orch_s1.txt ~/exp_data/ch4_J/
+
+echo "=== Scenario 1 Results ==="
+tail -3 ~/exp_data/ch4_J/gemm_orch_s1.txt
+grep "Requests/sec" ~/exp_data/ch4_J/wrk_s1.txt
+
+# Cleanup
+ssh $(whoami)@172.28.4.77 "
+  docker rm -f nginx-exp
+  sudo ip addr del ${VIP}/24 dev ${HOST_IFACE} 2>/dev/null || true
+"
+sleep 5
+```
+
+### 13b. Blue-green migration overhead (5 repetitions)
+
+```bash
+echo "=== Blue-green Migration Overhead ==="
+echo "run,container_ms,health_ms,vip_ms,stop_ms,total_ms" > ~/exp_data/ch4_J/migration.csv
+
+for run in $(seq 1 5); do
+  # Setup: Nginx on host with VIP
+  ssh $(whoami)@172.28.4.77 "
+    docker run -d --name nginx-exp --network=host nginx:alpine
+    sudo ip addr add ${VIP}/24 dev ${HOST_IFACE} 2>/dev/null || true
+    sleep 2
+  "
+
+  T0=$(date +%s%3N)
+
+  # Step 1: Start new container on BF2
+  ssh $(whoami)@172.28.4.77 "
+    ssh root@192.168.100.2 '
+      docker rm -f nginx-new 2>/dev/null
+      docker run -d --name nginx-new --network=host nginx:alpine
+    '
+  "
+  T1=$(date +%s%3N)
+
+  # Step 2: Health check
+  until ssh $(whoami)@172.28.4.77 "ssh root@192.168.100.2 'curl -sf http://localhost/ >/dev/null'" 2>/dev/null; do
+    sleep 0.2
+  done
+  T2=$(date +%s%3N)
+
+  # Step 3: VIP switch
+  ssh $(whoami)@172.28.4.77 "
+    sudo ip addr del ${VIP}/24 dev ${HOST_IFACE} 2>/dev/null || true
+    ssh root@192.168.100.2 '
+      ip addr add ${VIP}/24 dev ${BF2_IFACE} 2>/dev/null || true
+      arping -c 2 -A -I ${BF2_IFACE} ${VIP} &>/dev/null &
+    '
+  "
+  T3=$(date +%s%3N)
+
+  # Step 4: Stop old container
+  ssh $(whoami)@172.28.4.77 "docker rm -f nginx-exp 2>/dev/null"
+  T4=$(date +%s%3N)
+
+  C_MS=$((T1 - T0)); H_MS=$((T2 - T1)); V_MS=$((T3 - T2)); S_MS=$((T4 - T3)); TOTAL=$((T4 - T0))
+  echo "  Run ${run}: container=${C_MS}ms health=${H_MS}ms vip=${V_MS}ms stop=${S_MS}ms total=${TOTAL}ms"
+  echo "${run},${C_MS},${H_MS},${V_MS},${S_MS},${TOTAL}" >> ~/exp_data/ch4_J/migration.csv
+
+  # Reset: move back to host
+  ssh $(whoami)@172.28.4.77 "
+    ssh root@192.168.100.2 '
+      ip addr del ${VIP}/24 dev ${BF2_IFACE} 2>/dev/null || true
+      docker rm -f nginx-new 2>/dev/null
+    '
+  "
+  sleep 2
+done
+
+echo ""
+cat ~/exp_data/ch4_J/migration.csv
+```
+
+### 13c. Scenario 2 — Static orchestration (Nginx on BF2, DGEMM on host)
+
+```bash
+# Start Nginx on BF2 with VIP
+ssh $(whoami)@172.28.4.77 "
+  ssh root@192.168.100.2 '
+    docker rm -f nginx-exp 2>/dev/null
+    docker run -d --name nginx-exp --network=host nginx:alpine
+    ip addr add ${VIP}/24 dev ${BF2_IFACE} 2>/dev/null || true
+    arping -c 2 -A -I ${BF2_IFACE} ${VIP} &>/dev/null &
+    sleep 3
+  '
+"
+
+# Start wrk against VIP (routed to BF2)
+wrk -t4 -c200 -d60s "http://${VIP}/" > ~/exp_data/ch4_J/wrk_s2.txt 2>&1 &
+WRK_PID=$!
+
+# Run DGEMM on host (Nginx now on BF2, no interference)
+ssh $(whoami)@172.28.4.77 "
+  sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
+    -o /tmp/perf_orch_s2.txt \
+    numactl --cpunodebind=0 --membind=0 \
+    env OPENBLAS_NUM_THREADS=16 \
+    ~/experiments/bench/gemm_bench/gemm_bench --duration=60 \
+    > /tmp/gemm_orch_s2.txt 2>&1
+"
+
+wait ${WRK_PID} 2>/dev/null
+scp $(whoami)@172.28.4.77:/tmp/gemm_orch_s2.txt ~/exp_data/ch4_J/
+scp $(whoami)@172.28.4.77:/tmp/perf_orch_s2.txt ~/exp_data/ch4_J/
+
+echo "=== Scenario 2 Results ==="
+tail -3 ~/exp_data/ch4_J/gemm_orch_s2.txt
+grep "Requests/sec" ~/exp_data/ch4_J/wrk_s2.txt
+
+# Cleanup
+ssh $(whoami)@172.28.4.77 "
+  ssh root@192.168.100.2 '
+    docker rm -f nginx-exp 2>/dev/null
+    ip addr del ${VIP}/24 dev ${BF2_IFACE} 2>/dev/null || true
+  '
+"
+```
+
+### 13d. Summary
 
 ```bash
 echo "============================================"
-echo "  CHAPTER 3 EXPERIMENT RESULTS SUMMARY"
+echo "  Experiment J: Orchestration Summary"
 echo "============================================"
+for s in 1 2; do
+  f=~/exp_data/ch4_J/gemm_orch_s${s}.txt
+  if [ -f "$f" ]; then
+    avg=$(awk 'NR>5 {s+=$1; n++} END{if(n>0) printf "%.1f", s/n}' "$f")
+    echo "  Scenario ${s}: DGEMM avg GFLOPS = ${avg}"
+  fi
+done
+echo ""
+echo "Scenario 1 Nginx (host):"
+grep "Requests/sec" ~/exp_data/ch4_J/wrk_s1.txt 2>/dev/null
+echo "Scenario 2 Nginx (BF2):"
+grep "Requests/sec" ~/exp_data/ch4_J/wrk_s2.txt 2>/dev/null
+echo ""
+echo "Migration overhead:"
+cat ~/exp_data/ch4_J/migration.csv
+echo ""
+echo "Baseline reference (Exp B): 405.1 GFLOPS"
+```
+
+---
+
+## 14. Data Collection Summary
+
+After all experiments complete (Ch.3 + Ch.4), run this to collect all results:
+
+```bash
+echo "============================================"
+echo "  FULL EXPERIMENT RESULTS SUMMARY"
+echo "============================================"
+
+echo ""
+echo "===== CHAPTER 3 ====="
 
 echo ""
 echo "=== Experiment D: Fault Recovery ==="
@@ -988,6 +1470,43 @@ for f in ~/exp_data/F/*.txt; do
   echo ""
 done
 
+echo ""
+echo "===== CHAPTER 4 ====="
+
+echo ""
+echo "=== Experiment G: Workload Profiling ==="
+for f in ~/exp_data/ch4_G/*.txt; do
+  echo "--- $(basename $f) ---"
+  cat "$f"
+  echo ""
+done
+
+echo ""
+echo "=== Experiment H: Co-location Interference ==="
+for s in 1 2 3; do
+  f=~/exp_data/ch4_H/gemm_s${s}.txt
+  [ -f "$f" ] && avg=$(awk 'NR>5 {s+=$1; n++} END{if(n>0) printf "%.1f", s/n}' "$f") && echo "Scenario ${s}: ${avg} GFLOPS"
+  [ -f ~/exp_data/ch4_H/perf_s${s}.txt ] && grep -E "LLC|context" ~/exp_data/ch4_H/perf_s${s}.txt
+  echo ""
+done
+
+echo ""
+echo "=== Experiment I: BF2 Nginx Performance ==="
+echo "--- x86 ---"
+cat ~/exp_data/ch4_I/nginx_x86.csv 2>/dev/null
+echo "--- BF2 ---"
+cat ~/exp_data/ch4_I/nginx_bf2.csv 2>/dev/null
+
+echo ""
+echo "=== Experiment J: Orchestration Strategy ==="
+for s in 1 2; do
+  f=~/exp_data/ch4_J/gemm_orch_s${s}.txt
+  [ -f "$f" ] && avg=$(awk 'NR>5 {s+=$1; n++} END{if(n>0) printf "%.1f", s/n}' "$f") && echo "Scenario ${s}: ${avg} GFLOPS"
+done
+echo "--- Migration overhead ---"
+cat ~/exp_data/ch4_J/migration.csv 2>/dev/null
+
+echo ""
 echo "============================================"
 echo "  END OF RESULTS"
 echo "============================================"
@@ -1009,12 +1528,15 @@ echo "============================================"
 | `CREATE EXTENSION timescaledb fails` | Check `shared_preload_libraries = 'timescaledb'` in `postgresql.conf` |
 | `cluster_master: db connect failed` | Verify DB_CONNSTR in config.sh |
 | `gRPC: connection refused` | Ensure cluster_master is running on port ${GRPC_PORT} |
-| Log shows no state transitions | Check heartbeat_interval and suspect_threshold in node_state.h |
 | `mock_slave: connection refused` | Ensure cluster_master is running: `pgrep -f cluster_master` |
+| Docker not found on BF2 | Run `bash scripts/setup_bf2_docker.sh` |
+| `wrk: command not found` | `sudo apt-get install wrk` or build from source |
+| VIP unreachable after migration | Check `ip addr show` on both host and BF2; verify OVS bridge |
+| Nginx container fails on BF2 | Check `docker logs nginx-exp` on BF2; verify arm64 image |
 
 ---
 
 ## Reporting Back
 
-After all experiments, paste the output of Section 9 here verbatim.
+After all experiments, paste the output of Section 14 here verbatim.
 Include any compilation errors, runtime errors, or unexpected behavior.
