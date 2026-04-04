@@ -31,8 +31,7 @@ ssh ${USER}@${FUJIAN_IP} "docker rm -f nginx 2>/dev/null; \
 sleep 3
 
 # Run DGEMM + wrk simultaneously
-ssh ${USER}@${FUJIAN_IP} "taskset -c 0-15 ${GEMM_BENCH} \
-    -n 1024 -t ${GEMM_THREADS} -d ${DURATION}" \
+ssh ${USER}@${FUJIAN_IP} "env OMP_NUM_THREADS=${GEMM_THREADS} taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/j1_gemm.txt" 2>&1 &
 GEMM_PID=$!
 
@@ -62,8 +61,7 @@ ssh ${USER}@${FUJIAN_IP} "ssh root@${BF_IP} 'arping -c 3 -A -I p1 ${VIP} &>/dev/
 sleep 2
 
 # Run DGEMM on host + wrk against VIP
-ssh ${USER}@${FUJIAN_IP} "taskset -c 0-15 ${GEMM_BENCH} \
-    -n 1024 -t ${GEMM_THREADS} -d ${DURATION}" \
+ssh ${USER}@${FUJIAN_IP} "env OMP_NUM_THREADS=${GEMM_THREADS} taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/j2_gemm.txt" 2>&1 &
 GEMM_PID=$!
 

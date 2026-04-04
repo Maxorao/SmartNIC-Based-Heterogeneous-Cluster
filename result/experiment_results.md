@@ -404,23 +404,23 @@ Used for workload classification to guide orchestration decisions.
 - **Nginx**: `nginx:alpine` Docker container, `--network=host`, default `worker_processes auto`
   - x86: 64 Nginx workers (64 logical CPUs)
   - BF2 ARM: 8 Nginx workers (8 Cortex-A72 cores)
-- **DGEMM**: OpenBLAS, N=1024, 16 threads pinned to NUMA node 0
+- **DGEMM**: OpenBLAS, N=1024, 16 threads pinned to NUMA node 0 (cores 0-15)
 - **wrk client**: 4 threads, 100 connections, 30s duration (from tianjin via 100G)
-- **perf stat**: LLC-load-misses, LLC-loads, context-switches (system-wide)
+- **perf stat**: LLC-load-misses, LLC-loads, context-switches (system-wide for Nginx, per-process for DGEMM)
 
 ### Results
 
 | Workload | Platform | Performance | LLC miss rate | Context Switches |
 |----------|----------|-------------|---------------|------------------|
-| Nginx | x86 host (64 cores) | **88,989 req/s** | 4.73% | 8,812,997 |
-| Nginx | BF2 ARM (8 cores) | **39,179 req/s** | — | — |
-| DGEMM | x86 host (16 cores) | **414.6 GFLOPS** | 18.28% | 318 |
+| Nginx | x86 host (64 cores) | **91,785 req/s** | 4.09% | 9,655,612 |
+| Nginx | BF2 ARM (8 cores) | **39,464 req/s** | — | — |
+| DGEMM | x86 host (16 cores) | **425.2 GFLOPS** | 18.32% | 499 |
 
 ### Analysis
 
-- **Nginx is I/O-intensive**: high context-switch count (8.8M in 30s) and low LLC miss rate (4.73%) indicate network I/O dominated workload. Minimal cache footprint makes it suitable for BF2 offloading.
-- **DGEMM is compute-intensive**: near-zero context switches (318 in 30s) and high LLC miss rate (18.28%) indicate heavy cache usage with large working set. Must stay on host x86 for performance.
-- **BF2 ARM delivers 44% of x86 Nginx throughput** (39.2k vs 89.0k req/s) with only 12.5% of the core count (8 vs 64). Per-core efficiency is ~3.5x higher, validating BF2 as a viable Nginx offload target.
+- **Nginx is I/O-intensive**: high context-switch count (9.66M in 30s) and low LLC miss rate (4.09%) indicate network I/O dominated workload. Minimal cache footprint makes it suitable for BF2 offloading.
+- **DGEMM is compute-intensive**: near-zero context switches (499 in 30s) and high LLC miss rate (18.32%) indicate heavy cache usage with large working set. Must stay on host x86 for performance.
+- **BF2 ARM delivers 43% of x86 Nginx throughput** (39.5k vs 91.8k req/s) with only 12.5% of the core count (8 vs 64). Per-core efficiency is ~3.4x higher, validating BF2 as a viable Nginx offload target.
 - These profiles directly inform the orchestration rule: migrate I/O-intensive (high ctx-sw, low LLC miss) workloads to BF2; keep compute-intensive (low ctx-sw, high LLC miss) workloads on host.
 
 ---
@@ -432,28 +432,28 @@ Extends Experiment B (Chapter 2) where interference source was monitoring agents
 
 ### Setup
 
-- **Scenario 1**: DGEMM alone (baseline), 60s, NUMA node 0
-- **Scenario 2**: DGEMM + Nginx co-located on same NUMA node (cpuset 0-15), wrk load from tianjin (4 threads, 200 connections, 60s)
-- **Scenario 3**: DGEMM alone on host, Nginx migrated to BF2, wrk against BF2 IP
+- **Scenario H.1**: DGEMM alone (baseline), 60s, 16 threads pinned to NUMA node 0 (cores 0-15)
+- **Scenario H.2**: DGEMM + Nginx co-located on same NUMA node (both cpuset 0-15), wrk load from tianjin (4 threads, 200 connections, 55s after 5s warmup)
+- **Scenario H.3**: DGEMM alone on host (cores 0-15), Nginx migrated to BF2, wrk against BF2 IP
 
 ### Results
 
 | Scenario | DGEMM (GFLOPS) | LLC miss rate | Context Switches | vs Baseline |
 |----------|----------------|---------------|------------------|-------------|
-| S1: DGEMM alone (baseline) | **413.0** | 18.46% | 575 | — |
-| S2: DGEMM + Nginx co-located | **317.4** | 22.26% | 205,187 | **−23.2%** |
-| S3: Nginx migrated to BF2 | **415.1** | 18.82% | 650 | **+0.5% (recovered)** |
+| H.1: DGEMM alone (baseline) | **420.5** | 18.76% | 877 | — |
+| H.2: DGEMM + Nginx co-located | **187.9** | 23.74% | 10,409,462 | **−55.3%** |
+| H.3: Nginx migrated to BF2 | **421.5** | 18.21% | 905 | **+0.2% (recovered)** |
 
 Nginx throughput during co-location:
-- S2 (on host): 87,175 req/s
-- S3 (on BF2): 37,945 req/s
+- H.2 (on host): 92,111 req/s
+- H.3 (on BF2): 37,963 req/s
 
 ### Analysis
 
-- **Nginx co-location causes 23.2% DGEMM degradation** (413.0 → 317.4 GFLOPS), far worse than monitoring agents (5.3% in Exp B). Nginx's high context-switch rate (205K in 60s) and additional LLC pressure (miss rate 18.46% → 22.26%) significantly disrupt DGEMM's cache-resident matrix operations.
-- **Migrating Nginx to BF2 fully recovers DGEMM performance** (415.1 GFLOPS, +0.5% vs baseline — within measurement noise). LLC miss rate returns to baseline (18.82%), and context switches drop back to near-zero (650).
-- **Compared to Exp B**: monitoring agent interference (5.3%) was moderate; Nginx interference (23.2%) is 4.4x worse, making SmartNIC offloading much more impactful for I/O-intensive service workloads.
-- **BF2 still provides meaningful Nginx throughput** (37.9k req/s) while completely eliminating host interference — a favorable trade-off when host compute capacity is the priority.
+- **Nginx co-location causes 55.3% DGEMM degradation** (420.5 → 187.9 GFLOPS) when both workloads are pinned to the same 16 cores. Nginx's massive context-switch rate (10.4M in 60s) and LLC pressure (miss rate 18.76% → 23.74%) severely disrupt DGEMM's cache-resident matrix operations. The 243s of system time (vs 26s baseline) indicates heavy kernel scheduling overhead.
+- **Migrating Nginx to BF2 fully recovers DGEMM performance** (421.5 GFLOPS, +0.2% vs baseline — within measurement noise). LLC miss rate returns to baseline (18.21%), and context switches drop back to near-zero (905).
+- **Compared to Exp B**: monitoring agent interference (5.3%) was moderate; Nginx interference (55.3%) is 10.4x worse, making SmartNIC offloading critical for I/O-intensive service workloads sharing compute resources.
+- **BF2 still provides meaningful Nginx throughput** (38.0k req/s) while completely eliminating host interference — a favorable trade-off when host compute capacity is the priority.
 
 ---
 
@@ -469,31 +469,31 @@ Measures Nginx throughput on x86 host vs BF2 ARM under controlled core counts an
 
 | Concurrency | x86 req/s | x86 latency | BF2 req/s | BF2 latency | BF2/x86 ratio |
 |-------------|-----------|-------------|-----------|-------------|----------------|
-| 10 | 29,422 | 267 µs | 18,958 | 437 µs | 64.4% |
-| 50 | 85,981 | 547 µs | 31,893 | 3.82 ms | 37.1% |
-| 100 | 89,428 | 1.10 ms | **39,413** | 3.24 ms | 44.1% |
-| 200 | 91,017 | 2.17 ms | 37,872 | 6.53 ms | 41.6% |
-| 400 | **91,182** | 25.36 ms | 36,823 | 13.61 ms | 40.4% |
+| 10 | 27,884 | 282 µs | 19,174 | 426 µs | 68.7% |
+| 50 | 84,117 | 559 µs | 32,012 | 1.57 ms | 38.1% |
+| 100 | 88,326 | 1.12 ms | **38,969** | 3.31 ms | 44.1% |
+| 200 | 91,975 | 2.15 ms | 38,065 | 5.87 ms | 41.4% |
+| 400 | **92,649** | 24.73 ms | 37,516 | 11.23 ms | 40.5% |
 
 ### I-2: Per-core comparison (CPU pinning)
 
-Isolates per-core efficiency by pinning Nginx to fixed core counts using `docker --cpuset-cpus` and setting `worker_processes` to match.
-- x86: pinned to cores 32-35 (NUMA node 1, avoids DGEMM interference on node 0)
+Isolates per-core efficiency by pinning Nginx to fixed core counts using `docker --cpuset-cpus`.
+- x86: pinned to cores 16-19 (NUMA node 1, avoids DGEMM interference on node 0)
 - BF2 ARM: pinned to cores 4-7
 - wrk: 4 threads, 100 connections, 30s
 
 | Cores | x86 (req/s) | BF2 ARM (req/s) | BF2/x86 | x86 per-core | BF2 per-core | Scaling (vs 1-core) |
 |-------|-------------|-----------------|---------|--------------|-------------|---------------------|
-| 1 | 40,112 | 9,913 | 24.7% | 40,112 | 9,913 | x86: 1.00x, BF2: 1.00x |
-| 2 | 73,375 | 20,046 | 27.3% | 36,688 | 10,023 | x86: 1.83x, BF2: 2.02x |
-| 4 | 94,583 | 31,154 | 32.9% | 23,646 | 7,789 | x86: 2.36x, BF2: 3.14x |
+| 1 | 46,053 | 9,968 | 21.6% | 46,053 | 9,968 | x86: 1.00x, BF2: 1.00x |
+| 2 | 83,524 | 17,445 | 20.9% | 41,762 | 8,723 | x86: 1.81x, BF2: 1.75x |
+| 4 | 88,899 | 31,236 | 35.1% | 22,225 | 7,809 | x86: 1.93x, BF2: 3.13x |
 
 ### Analysis
 
-- **x86 saturates at ~91k req/s** (all cores, c≥200), BF2 ARM peaks at ~39.4k req/s (all cores, c=100).
-- **Per-core throughput**: x86 single-core (40.1k req/s) is 4.0x faster than BF2 single-core (9.9k req/s), reflecting the Xeon Gold 5218's higher clock speed (2.3 GHz + turbo) and wider pipeline vs Cortex-A72 (2.0 GHz, in-order).
-- **BF2 scales more linearly**: 4-core/1-core scaling is 3.14x on BF2 vs 2.36x on x86. ARM's simpler memory subsystem has less inter-core contention for I/O workloads. x86 hits diminishing returns earlier due to LLC and memory bandwidth contention across hyper-threaded cores.
-- **x86 per-core throughput drops at 4 cores** (23.6k vs 40.1k single-core), while BF2 maintains efficiency better (7.8k vs 9.9k) — hyper-threading and shared LLC on x86 create more per-core overhead under concurrent network I/O.
+- **x86 saturates at ~92k req/s** (all cores, c≥200), BF2 ARM peaks at ~39.0k req/s (all cores, c=100).
+- **Per-core throughput**: x86 single-core (46.1k req/s) is 4.6x faster than BF2 single-core (10.0k req/s), reflecting the Xeon Gold 5218's higher clock speed (2.3 GHz + turbo) and wider superscalar pipeline vs Cortex-A72 (2.0 GHz, in-order).
+- **BF2 scales more linearly at 4 cores**: 4-core/1-core scaling is 3.13x on BF2 vs 1.93x on x86. ARM's simpler memory subsystem has less inter-core contention for I/O workloads. x86 hits diminishing returns earlier due to LLC and memory bandwidth contention across hyper-threaded cores.
+- **x86 per-core throughput drops sharply at 4 cores** (22.2k vs 46.1k single-core = 48% of single-core), while BF2 maintains efficiency better (7.8k vs 10.0k = 78% of single-core) — hyper-threading and shared LLC on x86 create more per-core overhead under concurrent network I/O.
 - **Practical implication**: BF2 with 4 dedicated cores handles ~31k req/s — sufficient for moderate web services while freeing all 64 host cores for compute workloads.
 
 ---
@@ -505,39 +505,40 @@ Compares cluster performance with/without workload orchestration using blue-gree
 ### Setup
 
 - **VIP**: 192.168.56.200 (fujian workload VIP)
-- **Scenario 1**: No orchestration — Nginx + DGEMM co-located on fujian host, VIP on host interface
-- **Scenario 2**: Static orchestration — Nginx on fujian BF2 with VIP, DGEMM alone on host
-- **Migration**: Blue-green deployment: start new on BF2, health check, VIP switch (arping), stop old on host
+- **Scenario J.1**: No orchestration — Nginx + DGEMM co-located on fujian host, VIP on host interface
+- **Scenario J.2**: Static orchestration — Nginx on fujian BF2 with VIP, DGEMM alone on host (cores 0-15)
+- **Migration**: Blue-green deployment: start new container on BF2, health check, VIP switch (gratuitous ARP), stop old container on host
 
 ### Scenario Results
 
-| Scenario | DGEMM (GFLOPS) | Nginx (req/s) | DGEMM vs baseline |
-|----------|----------------|---------------|-------------------|
-| S1: No orchestration (co-located) | **309.5** | 91,204 | **−25.1%** |
-| S2: Static orchestration (Nginx→BF2) | **415.4** | 38,852 | **+0.6% (recovered)** |
+| Scenario | DGEMM (GFLOPS) | Nginx (req/s) | DGEMM vs baseline (420.5) |
+|----------|----------------|---------------|---------------------------|
+| J.1: No orchestration (co-located) | **350.1** | 91,052 | **−16.8%** |
+| J.2: Static orchestration (Nginx→BF2) | **424.1** | 38,212 | **+0.9% (recovered)** |
 
 ### Blue-Green Migration Overhead (5 repetitions)
 
 | Step | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Avg |
 |------|-------|-------|-------|-------|-------|-----|
-| Container start (BF2) | 2,126 ms | 1,798 ms | 1,783 ms | 1,810 ms | 1,812 ms | **1,866 ms** |
-| Health check | 1,379 ms | 1,380 ms | 1,399 ms | 1,360 ms | 1,340 ms | **1,372 ms** |
-| VIP switch | 1,351 ms | 1,360 ms | 1,381 ms | 1,370 ms | 1,351 ms | **1,363 ms** |
-| Old container stop | 1,161 ms | 1,172 ms | 1,238 ms | 1,083 ms | 1,223 ms | **1,175 ms** |
-| **Total** | 6,017 ms | 5,710 ms | 5,801 ms | 5,623 ms | 5,726 ms | **5,775 ms** |
+| Container start (BF2) | 1,135 ms | 1,763 ms | 1,803 ms | 2,144 ms | 1,794 ms | **1,728 ms** |
+| Health check | 697 ms | 1,356 ms | 1,387 ms | 1,356 ms | 1,369 ms | **1,233 ms** |
+| VIP switch | 1,548 ms | 2,898 ms | 2,918 ms | 2,918 ms | 2,897 ms | **2,636 ms** |
+| Old container stop | 2,616 ms | 2,536 ms | 2,666 ms | 2,458 ms | 2,507 ms | **2,557 ms** |
+| **Total** | 6,008 ms | 8,566 ms | 8,787 ms | 8,888 ms | 8,578 ms | **8,165 ms** |
 
 ### Analysis
 
-- **Without orchestration, DGEMM loses 25.1%** (309.5 vs 413.0 GFLOPS baseline) — consistent with Exp H Scenario 2.
-- **With orchestration, DGEMM fully recovers** (415.4 GFLOPS, +0.6% vs baseline). Nginx on BF2 still delivers 38.9k req/s via VIP routing.
-- **Blue-green migration takes ~5.8 seconds** with minimal variance (σ = 141ms). Breakdown:
-  - Container start (1.9s): Docker pull (cached) + container init on BF2 ARM
-  - Health check (1.4s): HTTP readiness probe via two-hop SSH
-  - VIP switch (1.4s): IP addr manipulation + gratuitous ARP, includes SSH latency
-  - Old stop (1.2s): container cleanup on host
-- **VIP switch itself is near-instant** (~few ms); the 1.4s measured includes SSH round-trip overhead. In production with a local orchestrator agent, VIP switch would be sub-100ms.
+- **Without orchestration, DGEMM loses 16.8%** (350.1 vs 420.5 GFLOPS baseline from Exp H). J.1 shows less degradation than H.2 (55.3%) because J.1 does not pin Nginx to the same cpuset — Nginx uses all 64 cores while DGEMM is pinned to cores 0-15, so CPU contention is less direct but LLC and memory bandwidth contention still cause measurable degradation.
+- **With orchestration, DGEMM fully recovers** (424.1 GFLOPS, +0.9% vs baseline). Nginx on BF2 still delivers 38.2k req/s via VIP routing.
+- **Blue-green migration takes ~8.2 seconds** on average. Breakdown:
+  - Container start (1.7s): Docker container init on BF2 ARM (image cached)
+  - Health check (1.2s): HTTP readiness probe via two-hop SSH
+  - VIP switch (2.6s): IP addr manipulation + gratuitous ARP (3 packets) via two-hop SSH
+  - Old container stop (2.6s): container cleanup + rename on both ends
+- **First run is fastest** (6.0s) due to warm SSH connections; subsequent runs are consistent (~8.6s).
+- **VIP switch itself is near-instant** (~few ms); the 2.6s measured includes SSH round-trip overhead through two hops. In production with a local orchestrator agent, VIP switch would be sub-100ms.
 - **Zero-downtime migration**: VIP is only moved after BF2 container passes health check, ensuring no service interruption.
-- **Net compute gain**: 25.1% DGEMM recovery (413 vs 309 GFLOPS = +104 GFLOPS) at the cost of 57% Nginx throughput reduction (91k → 39k req/s). For compute-bound workloads, this is a favorable trade-off.
+- **Net compute gain**: 16.8% DGEMM recovery (420 vs 350 GFLOPS = +70 GFLOPS) at the cost of 58% Nginx throughput reduction (91k → 38k req/s). For compute-bound workloads, this is a favorable trade-off. When both are co-located on the same cpuset (Exp H), recovery is even more dramatic (55.3% → 0.2%).
 
 ---
 
@@ -557,3 +558,8 @@ Compares cluster performance with/without workload orchestration using blue-gree
     - `FUJIAN_BF2_FABRIC`, `HELONG_BF2_FABRIC`: BF2 fabric IPs for direct access
     - `VIP_FUJIAN="192.168.56.200"`, `VIP_HELONG="192.168.56.201"`: floating VIPs for migratable workloads
     - `ORCHESTRATOR`: path to orchestrator.py
+
+15. **Experiment script fixes** (`scripts/ch4_exp_G/H/J_*.sh`): Fixed `gemm_bench` invocations:
+    - Changed `-n 1024 -t 16 -d $DURATION` to `--size=1024 --duration=$DURATION` (binary uses long options only)
+    - Added `env OMP_NUM_THREADS=N` prefix for thread control (OpenBLAS uses env vars, not CLI flags)
+    - Used `env` after `perf stat --` to ensure proper environment variable propagation

@@ -69,7 +69,7 @@ echo "--- G.3: DGEMM on x86 (fujian, 16 cores on NUMA0) ---"
 
 ssh ${USER}@${FUJIAN_IP} "sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
     -o /tmp/perf_dgemm_x86.txt -- \
-    taskset -c 0-15 ${GEMM_BENCH} -n 1024 -t 16 -d ${DURATION}" \
+    env OMP_NUM_THREADS=16 taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/gemm_x86.txt" 2>&1
 
 ssh ${USER}@${FUJIAN_IP} "cat /tmp/perf_dgemm_x86.txt" > "${OUT_DIR}/perf_dgemm_x86.txt"

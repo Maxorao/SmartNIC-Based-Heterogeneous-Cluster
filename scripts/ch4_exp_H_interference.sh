@@ -23,7 +23,7 @@ echo "--- H.1: DGEMM alone (baseline, ${DURATION}s) ---"
 
 ssh ${USER}@${FUJIAN_IP} "sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
     -o /tmp/perf_h1.txt -- \
-    taskset -c 0-15 ${GEMM_BENCH} -n 1024 -t ${GEMM_THREADS} -d ${DURATION}" \
+    env OMP_NUM_THREADS=${GEMM_THREADS} taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/h1_gemm_alone.txt" 2>&1
 
 ssh ${USER}@${FUJIAN_IP} "cat /tmp/perf_h1.txt" > "${OUT_DIR}/h1_perf.txt"
@@ -44,7 +44,7 @@ sleep 3
 # Start DGEMM + perf in background
 ssh ${USER}@${FUJIAN_IP} "sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
     -o /tmp/perf_h2.txt -- \
-    taskset -c 0-15 ${GEMM_BENCH} -n 1024 -t ${GEMM_THREADS} -d ${DURATION}" \
+    env OMP_NUM_THREADS=${GEMM_THREADS} taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/h2_gemm_colocated.txt" 2>&1 &
 GEMM_PID=$!
 
@@ -72,7 +72,7 @@ sleep 3
 # Start DGEMM on host with perf
 ssh ${USER}@${FUJIAN_IP} "sudo perf stat -e LLC-load-misses,LLC-loads,context-switches \
     -o /tmp/perf_h3.txt -- \
-    taskset -c 0-15 ${GEMM_BENCH} -n 1024 -t ${GEMM_THREADS} -d ${DURATION}" \
+    env OMP_NUM_THREADS=${GEMM_THREADS} taskset -c 0-15 ${GEMM_BENCH} --size=1024 --duration=${DURATION}" \
     > "${OUT_DIR}/h3_gemm_offloaded.txt" 2>&1 &
 GEMM_PID=$!
 
