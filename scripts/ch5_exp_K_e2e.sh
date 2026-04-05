@@ -77,9 +77,9 @@ echo "  - SmartNIC: no slave_agent, no Comch endpoint"
 # Start cluster_master on tianjin (needed to accept gRPC DirectPush reports)
 echo "[K.1] Starting cluster_master on tianjin..."
 nohup ${CLUSTER_MASTER} \
-    --grpc-port=${GRPC_PORT} \
-    --http-port=${HTTP_STATUS_PORT} \
-    --db-connstr="${DB_CONNSTR}" \
+    --grpc-port ${GRPC_PORT} \
+    --http-port ${HTTP_STATUS_PORT} \
+    --db-connstr "${DB_CONNSTR}" \
     > "${OUT_DIR}/k1_master.log" 2>&1 &
 K1_MASTER_PID=$!
 sleep 3
@@ -144,9 +144,9 @@ echo "  - Nginx on host (still co-located with DGEMM)"
 # Start cluster_master on tianjin
 echo "[K.2] Starting cluster_master..."
 nohup ${CLUSTER_MASTER} \
-    --grpc-port=${GRPC_PORT} \
-    --http-port=${HTTP_STATUS_PORT} \
-    --db-connstr="${DB_CONNSTR}" \
+    --grpc-port ${GRPC_PORT} \
+    --http-port ${HTTP_STATUS_PORT} \
+    --db-connstr "${DB_CONNSTR}" \
     > "${OUT_DIR}/k2_master.log" 2>&1 &
 MASTER_PID=$!
 sleep 3
@@ -155,7 +155,7 @@ sleep 3
 echo "[K.2] Starting slave_agent on fujian-bf2..."
 ssh ${FUJIAN_SSH} "ssh root@${BF_IP} 'pkill -f slave_agent 2>/dev/null || true; sleep 1; \
     nohup ${NIC_SLAVE_AGENT} \
-    --pci=${NIC_PCI} \
+    --dev-pci=${NIC_PCI} \
     --master-addr=${MASTER_100G}:${GRPC_PORT} \
     --heartbeat-ms=${HEARTBEAT_INTERVAL_MS} \
     > /tmp/slave_agent.log 2>&1 &'"

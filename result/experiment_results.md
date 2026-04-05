@@ -563,3 +563,45 @@ Compares cluster performance with/without workload orchestration using blue-gree
     - Changed `-n 1024 -t 16 -d $DURATION` to `--size=1024 --duration=$DURATION` (binary uses long options only)
     - Added `env OMP_NUM_THREADS=N` prefix for thread control (OpenBLAS uses env vars, not CLI flags)
     - Used `env` after `perf stat --` to ensure proper environment variable propagation
+
+---
+
+## Experiment K: End-to-End Three-Configuration Comparison (Chapter 5)
+
+Compares DGEMM throughput, Nginx throughput, and system-level metrics across three deployment configurations, demonstrating the cumulative benefit of the full SmartNIC-based heterogeneous cluster system.
+
+### Setup
+
+All configurations run on the fujian worker node with DGEMM pinned to cores 0-15 (NUMA node 0), 60s duration, wrk from tianjin (4 threads, 200 connections, 55s after 5s warmup).
+
+- **K.1 No offloading baseline**: 8 `metric_push` instances in gRPC fallback mode (10ms interval, simulating traditional TCP monitoring agents) + Nginx (cpuset 0-15) + DGEMM (cores 0-15), all co-located. `cluster_master` on tianjin accepts gRPC reports. No SmartNIC slave_agent.
+- **K.2 Control plane offloading only** (Ch2+Ch3): `cluster_master` on tianjin, `slave_agent` on fujian-bf2, single `metric_push` via Comch (1s interval). Nginx still co-located with DGEMM on host (cpuset 0-15).
+- **K.3 Full system** (Ch2+Ch3+Ch4): Same control plane as K.2, but Nginx migrated to fujian-bf2 with VIP 192.168.56.200. DGEMM runs alone on host cores 0-15.
+
+### Results
+
+| Config | DGEMM (GFLOPS) | Nginx (req/s) | LLC miss rate | Context Switches | DGEMM vs K.3 |
+|--------|----------------|---------------|---------------|------------------|---------------|
+| K.1: No offloading | **185.4** | 89,831 | 25.77% | 11,318,128 | **−56.0%** |
+| K.2: CP offload only | **190.2** | 89,771 | 23.92% | 9,865,722 | **−54.9%** |
+| K.3: Full system | **421.6** | 35,708 | 18.43% | 894 | **baseline** |
+
+### Detailed perf stats
+
+| Config | User time (s) | System time (s) | sys/user ratio |
+|--------|---------------|-----------------|----------------|
+| K.1 | 468.9 | 248.0 | 52.9% |
+| K.2 | 481.1 | 243.6 | 50.6% |
+| K.3 | 933.8 | 27.2 | 2.9% |
+
+### Analysis
+
+- **K.1 → K.2 (control plane offloading)**: Replacing 8 gRPC-mode metric_push instances (10ms interval) with a single Comch-mode instance (1s interval) yields only marginal DGEMM improvement (185.4 → 190.2 GFLOPS, +2.6%). The dominant interference source is Nginx co-location, not the monitoring agents. LLC miss rate drops slightly (25.77% → 23.92%) and context switches decrease by 12.8% (11.3M → 9.9M), confirming the control plane offload reduces kernel scheduling overhead.
+
+- **K.2 → K.3 (workload offloading)**: Migrating Nginx to BF2 delivers the transformative improvement: DGEMM recovers to 421.6 GFLOPS (+121.6% vs K.2), LLC miss rate returns to baseline (18.43%), and context switches drop from 9.9M to 894 (−99.99%). System time drops from 243.6s to 27.2s, confirming that Nginx's network I/O was the primary source of kernel overhead.
+
+- **K.1 → K.3 (full system benefit)**: The complete SmartNIC-based system recovers 236.2 GFLOPS of compute capacity (+127.4%), at the cost of reducing Nginx throughput from 89.8k to 35.7k req/s (−60.3%). This trade-off is favorable for compute-bound HPC workloads where host CPU cycles are the bottleneck.
+
+- **Layered contribution**: Control plane offloading (Ch2+Ch3) contributes ~2.6% DGEMM recovery; workload orchestration (Ch4) contributes ~121.6%. The two layers are complementary — Ch2+Ch3 provides the infrastructure (Comch transport, gRPC management, fault tolerance) that enables Ch4's automated workload migration decisions.
+
+- **Context switch analysis**: K.1 and K.2 show ~10M context switches in 60s (Nginx-dominated scheduling), while K.3 drops to 894. This 4-order-of-magnitude reduction confirms that offloading I/O-intensive workloads to the SmartNIC eliminates the primary source of compute interference.
