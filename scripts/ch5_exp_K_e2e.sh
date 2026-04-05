@@ -68,29 +68,41 @@ echo ""
 echo "=========================================="
 echo " K.1: No Offloading Baseline"
 echo "=========================================="
-echo "  - metric_push x${N_MONITORS} instances on host (TCP mode, simulating traditional agents)"
-echo "  - Nginx on host"
-echo "  - DGEMM on host (cores 0-15)"
-echo "  - SmartNIC unused"
+echo "  - cluster_master on tianjin (receives gRPC reports)"
+echo "  - metric_push x${N_MONITORS} instances on fujian host (gRPC fallback mode)"
+echo "  - Nginx on fujian host (co-located with DGEMM)"
+echo "  - DGEMM on fujian host (cores 0-15)"
+echo "  - SmartNIC: no slave_agent, no Comch endpoint"
+
+# Start cluster_master on tianjin (needed to accept gRPC DirectPush reports)
+echo "[K.1] Starting cluster_master on tianjin..."
+nohup ${CLUSTER_MASTER} \
+    --grpc-port=${GRPC_PORT} \
+    --http-port=${HTTP_STATUS_PORT} \
+    --db-connstr="${DB_CONNSTR}" \
+    > "${OUT_DIR}/k1_master.log" 2>&1 &
+K1_MASTER_PID=$!
+sleep 3
 
 # Start Nginx on fujian host
 ssh ${FUJIAN_SSH} "docker rm -f nginx 2>/dev/null; \
     docker run -d --name nginx --network=host --cpuset-cpus=0-15 nginx:alpine"
 sleep 2
 
-# Start N_MONITORS metric_push instances in TCP/direct mode on fujian host
-# These simulate traditional control plane agents (kubelet, cAdvisor, etc.)
-echo "[K.1] Starting ${N_MONITORS} metric_push instances (TCP mode)..."
+# Start N_MONITORS metric_push instances on fujian host
+# Without slave_agent on BF2, Comch init will fail → automatic gRPC fallback
+# This simulates traditional agents sending via full TCP/gRPC network stack
+echo "[K.1] Starting ${N_MONITORS} metric_push instances (gRPC fallback)..."
 for i in $(seq 1 ${N_MONITORS}); do
     ssh ${FUJIAN_SSH} "nohup taskset -c 0-15 ${METRIC_PUSH_V2} \
-        --mode=grpc \
+        --pci=${HOST_PCI} \
         --master-addr=${MASTER_100G}:${GRPC_PORT} \
-        --interval-ms=${HIGH_LOAD_INTERVAL} \
+        --interval=${HIGH_LOAD_INTERVAL} \
         --node-id=exp-k1-agent-${i} \
         > /dev/null 2>&1 &"
 done
-sleep 3
-echo "[K.1] ${N_MONITORS} agents started"
+sleep 5  # wait for Comch failures and gRPC fallback activation
+echo "[K.1] ${N_MONITORS} agents started (Comch failed → gRPC fallback active)"
 
 # Start DGEMM with perf stat
 echo "[K.1] Running DGEMM (${DURATION}s)..."
@@ -112,6 +124,7 @@ ssh ${FUJIAN_SSH} "cat /tmp/perf_k1.txt" > "${OUT_DIR}/k1_perf.txt"
 # Cleanup K.1
 ssh ${FUJIAN_SSH} "pkill -f metric_push 2>/dev/null || true"
 ssh ${FUJIAN_SSH} "docker rm -f nginx 2>/dev/null || true"
+kill ${K1_MASTER_PID} 2>/dev/null || true
 sleep 5
 
 echo "[K.1] Done. Results: k1_gemm.txt, k1_wrk.txt, k1_perf.txt"
@@ -148,13 +161,13 @@ ssh ${FUJIAN_SSH} "ssh root@${BF_IP} 'pkill -f slave_agent 2>/dev/null || true; 
     > /tmp/slave_agent.log 2>&1 &'"
 sleep 3
 
-# Start metric_push on fujian host (Comch offload mode — single lightweight instance)
+# Start metric_push on fujian host (Comch mode — single lightweight instance)
+# With slave_agent running on BF2, Comch init will succeed → PCIe offload path
 echo "[K.2] Starting metric_push (Comch mode)..."
 ssh ${FUJIAN_SSH} "nohup ${METRIC_PUSH_V2} \
-    --mode=comch \
     --pci=${HOST_PCI} \
     --master-addr=${MASTER_100G}:${GRPC_PORT} \
-    --interval-ms=1000 \
+    --interval=1000 \
     --node-id=fujian \
     > /tmp/metric_push.log 2>&1 &"
 sleep 2
@@ -200,12 +213,11 @@ echo "  - metric_push on fujian host (Comch mode)"
 echo "  - Nginx on fujian-bf2 (migrated)"
 echo "  - DGEMM alone on host"
 
-# Restart metric_push on fujian host
+# Restart metric_push on fujian host (Comch mode)
 ssh ${FUJIAN_SSH} "nohup ${METRIC_PUSH_V2} \
-    --mode=comch \
     --pci=${HOST_PCI} \
     --master-addr=${MASTER_100G}:${GRPC_PORT} \
-    --interval-ms=1000 \
+    --interval=1000 \
     --node-id=fujian \
     > /tmp/metric_push.log 2>&1 &"
 sleep 2
