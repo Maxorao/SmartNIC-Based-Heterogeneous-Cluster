@@ -147,7 +147,7 @@ OFFLINE_THRESHOLD_S=45
 # ---------------------------------------------------------------
 # Chapter 4: Workload orchestration
 # ---------------------------------------------------------------
-mkdir -p "${DATA_DIR}"/{ch4_F,ch4_G,ch4_H,ch4_I} 2>/dev/null
+mkdir -p "${DATA_DIR}"/{ch4_F,ch4_G,ch4_H,ch4_I,K} 2>/dev/null
 
 # Orchestrator
 ORCHESTRATOR="${EXP_BASE}/control-plane/orchestrator/orchestrator.py"
