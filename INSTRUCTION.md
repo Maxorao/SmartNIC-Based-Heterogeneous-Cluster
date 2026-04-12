@@ -1450,7 +1450,7 @@ Experiment A measures the following 7 paths plus a bandwidth verification:
 
 | # | Path | Type | Tool | Expected |
 |---|------|------|------|----------|
-| 1 | Host ↔ local NIC ARM (PCIe Comch) | L1 kernel-bypass | `bench/comch_pingpong` | ~29 μs |
+| 1 | Host ↔ local NIC ARM (PCIe Comch) | L1 kernel-bypass | `bench/latency_bench` | ~29 μs |
 | 2 | Host ↔ remote host via eno1 (1G mgmt) | Kernel TCP | sockperf | ~200 μs |
 | 3 | Host ↔ remote host via 100G VF | Kernel TCP | sockperf | ~80-100 μs |
 | 4 | ARM ↔ remote ARM via OVS | Kernel TCP | sockperf | ~80 μs |
@@ -1522,41 +1522,52 @@ Take 3 measurement runs per path per message size and record the **median of the
 
 ### 14c. Path 1: Host ↔ Local NIC ARM (PCIe Comch)
 
-This path measures the L1 PCIe kernel-bypass tunnel using the existing Comch ping-pong benchmark. Run it on one host↔local-NIC pair (e.g., tianjin host ↔ tianjin BF-2).
+This path measures the L1 PCIe kernel-bypass tunnel using the existing latency benchmark (`bench/latency_bench/`). This is the same tool used for the original Experiment A (paths 1-2).
+
+> **Note**: If you already have the original Experiment A data for Comch latency (~29 μs), you can **reuse that data** for Path 1 without re-running. The PCIe Comch latency is a hardware characteristic that does not change.
+
+The tool consists of two binaries:
+- `bench_host` (runs on x86 host, client side)
+- `bench_nic` (runs on BF-2 ARM, server side)
 
 ```bash
-# On tianjin BF-2 ARM (server)
+# Step 1: Build (if not already compiled)
+# On tianjin host (x86):
+cd ~/thesis-experiments/bench/latency_bench
+make host     # produces bench_host
+
+# On tianjin BF-2 ARM (must compile ON the ARM):
+cd ~/thesis-experiments/bench/latency_bench
+make nic      # produces bench_nic
+
+# Step 2: Find the PCI address of the BF-2
+PCI_ADDR=$(lspci | grep -i mellanox | head -1 | awk '{print $1}')
+echo "PCI address: ${PCI_ADDR}"
+
+# Step 3: Run the benchmark
+# On tianjin BF-2 ARM (server, start first):
 ssh root@<tianjin-bf2-ip> "
-  cd ~/thesis-experiments/build
-  pkill -f comch_pingpong 2>/dev/null
-  ./bench/comch_pingpong --role server --size 64 --iterations 10000 \
-    > /tmp/comch_path1_64.log 2>&1 &
+  cd ~/thesis-experiments/bench/latency_bench
+  pkill -f bench_nic 2>/dev/null; sleep 1
+  nohup ./bench_nic --pci=${PCI_ADDR} > /tmp/bench_nic.log 2>&1 &
 "
+sleep 3
 
-sleep 2
+# On tianjin host (client):
+cd ~/thesis-experiments/bench/latency_bench
+./bench_host --pci=${PCI_ADDR} --mode=comch --size=all --iters=10000 \
+  --output-dir=$HOME/exp_data/A/ \
+  > ~/exp_data/A/path1_comch.log 2>&1
 
-# On tianjin host (client)
-cd ~/thesis-experiments/build
-./bench/comch_pingpong --role client --size 64 --iterations 10000 \
-  > ~/exp_data/A/path1_64.log 2>&1
-
-# Repeat for sizes 256 and 1024
-for size in 256 1024; do
-  ssh root@<tianjin-bf2-ip> "
-    pkill -f comch_pingpong 2>/dev/null
-    cd ~/thesis-experiments/build
-    ./bench/comch_pingpong --role server --size ${size} --iterations 10000 \
-      > /tmp/comch_path1_${size}.log 2>&1 &
-  "
-  sleep 2
-  ./bench/comch_pingpong --role client --size ${size} --iterations 10000 \
-    > ~/exp_data/A/path1_${size}.log 2>&1
-done
+# This measures Comch ping-pong for sizes 64, 256, 1024 bytes × 10000 iterations each
 ```
 
-**Record**: min, median (typical), avg, max, p99, p99.9 for each message size. Expected typical ≈ 29 μs regardless of size.
+**Record**: min, median (typical), avg, max latency for each message size. Expected typical ≈ 29 μs regardless of size.
 
-**Note**: If `comch_pingpong` is not built, check `experiments/bench/Makefile` and rebuild it (see Section 5a).
+**Cleanup**:
+```bash
+ssh root@<tianjin-bf2-ip> "pkill -f bench_nic 2>/dev/null"
+```
 
 ### 14d. Install sockperf (if not installed)
 
@@ -1805,8 +1816,8 @@ ssh root@<tianjin-bf2-ip> "pkill -f ib_write_bw 2>/dev/null"
 
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
-| Path 1 comch_pingpong hangs | BF-2 Comch server not running | Check BF-2 log; ensure DOCA service running |
-| Path 1 typical ≠ ~29 μs | Non-release DOCA build or different PCIe gen | Verify `ibv_devinfo` shows PCIe Gen4; rebuild comch_pingpong in release mode |
+| Path 1 bench_nic hangs | BF-2 Comch server not running | Check BF-2 log; ensure DOCA service running |
+| Path 1 typical ≠ ~29 μs | Non-release DOCA build or different PCIe gen | Verify `ibv_devinfo` shows PCIe Gen4; rebuild bench_nic in release mode |
 | Path 6/7 "Failed to modify QP to RTR" | SF mismatch or GID missing | Re-run `bf2_rdma_setup.sh`; check `show_gids` |
 | Path 7 only gets < 1 MB/s bandwidth | OVS NORMAL not hw-offloaded | Check `tc -s filter show dev p1 ingress \| grep in_hw`; if missing, restart OVS after setting `hw-offload=true` |
 | Path 7 IPv4 GID missing | SF netdev IP not assigned | `ip addr add 192.168.56.12/24 dev enp3s0f1s0` then `ip link set enp3s0f1s0 up` |
@@ -1825,7 +1836,7 @@ echo "Path  Size  t_min  t_typical  t_avg  t_max  p99  p99.9"
 # Path 1 (comch)
 for size in 64 256 1024; do
   if [ -f path1_${size}.log ]; then
-    # Adjust grep patterns based on actual comch_pingpong output format
+    # Adjust grep patterns based on actual bench_nic output format
     grep -E "min|median|avg|max|p99" path1_${size}.log | \
       awk -v p="1" -v s="${size}" 'NR==1{printf "%s  %s  ", p, s} {printf "%s  ", $NF} END{print ""}'
   fi
@@ -1898,14 +1909,14 @@ pkill -f sockperf 2>/dev/null
 pkill -f "ib_write_lat" 2>/dev/null
 pkill -f "ib_read_lat" 2>/dev/null
 pkill -f "ib_write_bw" 2>/dev/null
-pkill -f comch_pingpong 2>/dev/null
+pkill -f bench_nic 2>/dev/null
 
 # Stop any lingering servers on BF-2 ARMs
 for bf2 in <tianjin-bf2-ip> <fujian-bf2-ip>; do
   ssh root@${bf2} "
     pkill -f sockperf 2>/dev/null
     pkill -f 'ib_write_lat\|ib_read_lat\|ib_write_bw' 2>/dev/null
-    pkill -f comch_pingpong 2>/dev/null
+    pkill -f bench_nic 2>/dev/null
   "
 done
 ```
