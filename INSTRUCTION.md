@@ -1424,7 +1424,495 @@ echo "Baseline reference (Exp B): 405.1 GFLOPS"
 
 ---
 
-## 14. Data Collection Summary
+## 14. Experiment A — Hierarchical Kernel-Bypass Tunnel Latency (Chapter 2)
+
+> **Goal**: Validate the three-layer hierarchical hardware-bypass tunnel architecture (Thesis §2.2.2) by measuring the single-way latency of seven distinct communication paths. The key data point is Path 7 (NIC ARM↔ARM RDMA), which represents the thesis's core contribution to Chapter 2.
+
+### Architecture
+
+```
+Worker node                                 Master node
++--------------+                           +--------------+
+| host process |                           | host process |
++------+-------+                           +------^-------+
+       | L1 PCIe Comch (~29μs)                    | L1 PCIe Comch (~29μs)
+       v                                          |
++------+-------+   L2 RDMA (~3.44μs, 85.8Gbps)   +------+-------+
+| BF-2 ARM     +---------------------------------+ BF-2 ARM     |
++--------------+                                 +--------------+
+(L3 eSwitch    (data flows ASIC-to-ASIC inside NIC, <1μs)
+ hardware offload inside each NIC)
+
+End-to-end: ~62 μs  (vs existing OVS-TCP path ~105 μs, α_tunnel ≈ 1.7x)
+```
+
+Experiment A measures the following 7 paths plus a bandwidth verification:
+
+| # | Path | Type | Tool | Expected |
+|---|------|------|------|----------|
+| 1 | Host ↔ local NIC ARM (PCIe Comch) | L1 kernel-bypass | `bench/comch_pingpong` | ~29 μs |
+| 2 | Host ↔ remote host via eno1 (1G mgmt) | Kernel TCP | sockperf | ~200 μs |
+| 3 | Host ↔ remote host via 100G VF | Kernel TCP | sockperf | ~80-100 μs |
+| 4 | ARM ↔ remote ARM via OVS | Kernel TCP | sockperf | ~80 μs |
+| 5 | Host ↔ remote host via OVS bridge | Kernel TCP + OVS | sockperf | ~105 μs |
+| 6 | Host VF ↔ remote host VF (RDMA control) | Hardware RDMA | `ib_write_lat` | ~2 μs |
+| 7 | ARM ↔ remote ARM (RDMA, thesis) | Hardware RDMA | `ib_write_lat`/`ib_read_lat` | ~3.44 / 5.04 μs |
+
+Path E2E (synthesized): $T_{e2e} = T_{L1} + T_{L2} + T_{L1} \approx 62$ μs. No chained tool is needed; this value is computed from Paths 1 and 7.
+
+### 14a. Pre-flight: RDMA environment setup on BF-2 ARMs
+
+Both BF-2 ARMs need a Scalable Function (SF) with a RoCE GID configured, and the SF representor must be in `ovsbr1`. The setup script `bf2_rdma_setup.sh` automates this.
+
+```bash
+# First, copy the script to both BF-2 ARMs from the Mac side:
+scp ~/Documents/final\ thesis/experiments/scripts/bf2_rdma_setup.sh \
+    tianjin:/tmp/bf2_rdma_setup.sh
+scp ~/Documents/final\ thesis/experiments/scripts/bf2_rdma_setup.sh \
+    fujian:/tmp/bf2_rdma_setup.sh
+
+# From the hosts, forward to BF-2 ARMs:
+# tianjin
+scp /tmp/bf2_rdma_setup.sh root@192.168.100.2:/root/
+# fujian
+scp /tmp/bf2_rdma_setup.sh root@192.168.100.2:/root/
+
+# Run on tianjin BF-2 (role A)
+ssh root@<tianjin-bf2-ip> "BF_ROLE=A bash /root/bf2_rdma_setup.sh"
+
+# Run on fujian BF-2 (role B)
+ssh root@<fujian-bf2-ip> "BF_ROLE=B bash /root/bf2_rdma_setup.sh"
+```
+
+**Verify** (on either BF-2 ARM):
+
+```bash
+ssh root@<bf2-ip> '
+  show_gids
+  echo "---"
+  ovs-vsctl show
+  echo "---"
+  ovs-ofctl dump-flows ovsbr1
+'
+```
+
+Expected: `show_gids` should list an IPv4 GID for the SF netdev (e.g., `192.168.56.12` on `enp3s0f1s0`). `ovs-vsctl show` should include the SF representor (e.g., `en3f1pf1sf0`) inside `ovsbr1`. `ovs-ofctl dump-flows ovsbr1` should have `actions=NORMAL`.
+
+**Sanity test** (both ARMs, basic RDMA should work):
+
+```bash
+# On tianjin BF-2 ARM (server)
+ib_write_bw -d <device> -F -s 4096 -n 1000 &
+sleep 2
+
+# On fujian BF-2 ARM (client)
+ib_write_bw -d <device> -F -s 4096 -n 1000 192.168.56.12
+```
+
+Replace `<device>` with the RDMA device that corresponds to the SF on port 1. Check it with `ls /sys/class/infiniband/*/device/net/` — the device whose subdirectory contains the SF netdev is the right one. Expected average bandwidth ~100 Gbps; if it is less than 10 Gbps, something is wrong (usually OVS flow table or hw-offload).
+
+### 14b. Setup common environment
+
+```bash
+source ~/thesis-experiments/scripts/config.sh
+mkdir -p ~/exp_data/A
+```
+
+Take 3 measurement runs per path per message size and record the **median of the 3 runs** as the final number. Each run should use at least 1000 iterations (10000 preferred).
+
+### 14c. Path 1: Host ↔ Local NIC ARM (PCIe Comch)
+
+This path measures the L1 PCIe kernel-bypass tunnel using the existing Comch ping-pong benchmark. Run it on one host↔local-NIC pair (e.g., tianjin host ↔ tianjin BF-2).
+
+```bash
+# On tianjin BF-2 ARM (server)
+ssh root@<tianjin-bf2-ip> "
+  cd ~/thesis-experiments/build
+  pkill -f comch_pingpong 2>/dev/null
+  ./bench/comch_pingpong --role server --size 64 --iterations 10000 \
+    > /tmp/comch_path1_64.log 2>&1 &
+"
+
+sleep 2
+
+# On tianjin host (client)
+cd ~/thesis-experiments/build
+./bench/comch_pingpong --role client --size 64 --iterations 10000 \
+  > ~/exp_data/A/path1_64.log 2>&1
+
+# Repeat for sizes 256 and 1024
+for size in 256 1024; do
+  ssh root@<tianjin-bf2-ip> "
+    pkill -f comch_pingpong 2>/dev/null
+    cd ~/thesis-experiments/build
+    ./bench/comch_pingpong --role server --size ${size} --iterations 10000 \
+      > /tmp/comch_path1_${size}.log 2>&1 &
+  "
+  sleep 2
+  ./bench/comch_pingpong --role client --size ${size} --iterations 10000 \
+    > ~/exp_data/A/path1_${size}.log 2>&1
+done
+```
+
+**Record**: min, median (typical), avg, max, p99, p99.9 for each message size. Expected typical ≈ 29 μs regardless of size.
+
+**Note**: If `comch_pingpong` is not built, check `experiments/bench/Makefile` and rebuild it (see Section 5a).
+
+### 14d. Install sockperf (if not installed)
+
+```bash
+# On all hosts and BF-2 ARMs
+which sockperf || sudo apt-get install -y sockperf
+# If apt has no sockperf package, build from source:
+# git clone https://github.com/Mellanox/sockperf.git
+# cd sockperf && ./autogen.sh && ./configure && make -j4 && sudo make install
+```
+
+### 14e. Path 2: Host ↔ remote host via eno1 (1G management)
+
+```bash
+# On tianjin host (server)
+# Get eno1 IP first
+TIANJIN_ENO1=$(ip -4 addr show eno1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+echo "tianjin eno1 IP: ${TIANJIN_ENO1}"
+sockperf server -i ${TIANJIN_ENO1} -p 12345 &
+SERVER_PID=$!
+sleep 1
+
+# On fujian host (client)
+for size in 64 256 1024; do
+  sockperf ping-pong --tcp -i <tianjin-eno1-ip> -p 12345 \
+    -t 30 -m ${size} --full-rtt \
+    > ~/exp_data/A/path2_${size}.log 2>&1
+  sleep 2
+done
+
+# On tianjin host, stop the server
+kill $SERVER_PID 2>/dev/null
+```
+
+**Record**: sockperf prints latency percentiles (50th = median). Expected median ~200 μs.
+
+### 14f. Path 3: Host ↔ remote host via 100G VF (kernel TCP)
+
+First identify the host-side 100G VF interface:
+
+```bash
+# On tianjin host (and fujian)
+ip -br addr | grep -v 'eno\|docker\|tmfifo'
+# Look for an interface like enp94s0f1np1 with an IP in 192.168.56.x range
+# Note the IP as <tianjin-100g-vf-ip>
+```
+
+```bash
+# Server (tianjin)
+sockperf server -i <tianjin-100g-vf-ip> -p 12346 &
+sleep 1
+
+# Client (fujian)
+for size in 64 256 1024; do
+  sockperf ping-pong --tcp -i <tianjin-100g-vf-ip> -p 12346 \
+    -t 30 -m ${size} --full-rtt \
+    > ~/exp_data/A/path3_${size}.log 2>&1
+  sleep 2
+done
+
+# Kill server
+pkill -f "sockperf server.*12346"
+```
+
+### 14g. Path 4: ARM ↔ remote ARM via OVS (kernel TCP)
+
+```bash
+# On tianjin BF-2 (server, SF IP 192.168.56.12)
+ssh root@<tianjin-bf2-ip> "
+  pkill -f sockperf 2>/dev/null
+  sockperf server -i 192.168.56.12 -p 12347 > /tmp/sockperf_server.log 2>&1 &
+"
+sleep 2
+
+# On fujian BF-2 (client)
+for size in 64 256 1024; do
+  ssh root@<fujian-bf2-ip> "
+    sockperf ping-pong --tcp -i 192.168.56.12 -p 12347 \
+      -t 30 -m ${size} --full-rtt
+  " > ~/exp_data/A/path4_${size}.log 2>&1
+  sleep 2
+done
+
+# Stop server
+ssh root@<tianjin-bf2-ip> "pkill -f sockperf"
+```
+
+### 14h. Path 5: Host ↔ remote host via OVS bridge (existing control baseline)
+
+This path is the current pre-RDMA baseline — host traffic goes through the OVS bridge on BF-2.
+
+```bash
+# Note: the "ovsbr1 IP" on BF-2 is the management IP for the OVS bridge
+# If host traffic is routed through BF-2 ovsbr1, use that IP path
+# Otherwise, use the same enp94s0f1np1 IP as Path 3 but via OVS bridge routing
+
+# Server (tianjin) - listen on ovsbr1 reachable IP
+sockperf server -i <tianjin-ovs-path-ip> -p 12348 &
+sleep 1
+
+# Client (fujian)
+for size in 64 256 1024; do
+  sockperf ping-pong --tcp -i <tianjin-ovs-path-ip> -p 12348 \
+    -t 30 -m ${size} --full-rtt \
+    > ~/exp_data/A/path5_${size}.log 2>&1
+  sleep 2
+done
+
+pkill -f "sockperf server.*12348"
+```
+
+**Note**: If Paths 3 and 5 produce the same numbers on your topology (because the 100G VF already goes through OVS hw-offload), you may record them as equivalent and mention this in the paper.
+
+### 14i. Path 6: Host VF RDMA (hardware lower bound, control)
+
+This path provides the ASIC hardware latency lower bound, used as a reference for measuring ARM libibverbs overhead.
+
+```bash
+# Identify host RDMA device (usually mlx5_1 for port 1)
+# On tianjin
+ls /sys/class/infiniband/
+# Typical output: mlx5_0, mlx5_1 — mlx5_1 is the port 1 PF, use this
+
+# Server (tianjin host)
+ib_write_lat -d mlx5_1 -F -s 64 -n 10000 &
+sleep 1
+
+# Client (fujian host)
+ib_write_lat -d mlx5_1 -F -s 64 -n 10000 <tianjin-100g-vf-ip> \
+  > ~/exp_data/A/path6_write_64.log 2>&1
+
+# Also measure READ latency
+pkill -f "ib_write_lat" 2>/dev/null
+ib_read_lat -d mlx5_1 -F -s 64 -n 10000 &
+sleep 1
+ib_read_lat -d mlx5_1 -F -s 64 -n 10000 <tianjin-100g-vf-ip> \
+  > ~/exp_data/A/path6_read_64.log 2>&1
+
+# Repeat for sizes 256 and 1024 (optional, usually latency is size-independent for small messages)
+```
+
+**Expected**: `t_typical ≈ 2 μs` for WRITE, `~3 μs` for READ. If significantly higher (e.g., > 10 μs), the hardware path is not fast — check OVS hw-offload state.
+
+### 14j. Path 7: NIC ARM RDMA (thesis main proposal)
+
+This is the key measurement for Chapter 2's contribution. The prerequisite (Section 14a) must have completed successfully.
+
+```bash
+# Identify the correct RDMA device on each BF-2 ARM
+# The SF netdev (e.g., enp3s0f1s0) lives under its associated mlx5_X
+# Find it:
+ssh root@<tianjin-bf2-ip> "
+  for dev in /sys/class/infiniband/mlx5_*; do
+    devname=\$(basename \$dev)
+    if [ -d \$dev/device/net/enp3s0f1s0 ]; then
+      echo \"tianjin: RDMA device for enp3s0f1s0 = \$devname\"
+    fi
+  done
+"
+
+ssh root@<fujian-bf2-ip> "
+  for dev in /sys/class/infiniband/mlx5_*; do
+    devname=\$(basename \$dev)
+    if [ -d \$dev/device/net/enp3s0f1s2 ]; then
+      echo \"fujian: RDMA device for enp3s0f1s2 = \$devname\"
+    fi
+  done
+"
+
+# Use the reported device names below (may differ on each BF-2)
+TIANJIN_RDMA=mlx5_3    # example, replace with actual
+FUJIAN_RDMA=mlx5_2     # example, replace with actual
+```
+
+Run the WRITE latency test:
+
+```bash
+# Server (tianjin BF-2)
+ssh root@<tianjin-bf2-ip> "
+  pkill -f ib_write_lat 2>/dev/null
+  ib_write_lat -d ${TIANJIN_RDMA} -F -s 64 -n 10000 > /tmp/path7_write_server.log 2>&1 &
+"
+sleep 2
+
+# Client (fujian BF-2)
+ssh root@<fujian-bf2-ip> "
+  ib_write_lat -d ${FUJIAN_RDMA} -F -s 64 -n 10000 192.168.56.12
+" > ~/exp_data/A/path7_write_64.log 2>&1
+
+# Cleanup
+ssh root@<tianjin-bf2-ip> "pkill -f ib_write_lat 2>/dev/null"
+```
+
+Run the READ latency test (same pattern):
+
+```bash
+ssh root@<tianjin-bf2-ip> "
+  pkill -f ib_read_lat 2>/dev/null
+  ib_read_lat -d ${TIANJIN_RDMA} -F > /tmp/path7_read_server.log 2>&1 &
+"
+sleep 2
+ssh root@<fujian-bf2-ip> "
+  ib_read_lat -d ${FUJIAN_RDMA} -F 192.168.56.12
+" > ~/exp_data/A/path7_read.log 2>&1
+ssh root@<tianjin-bf2-ip> "pkill -f ib_read_lat 2>/dev/null"
+```
+
+**Expected**:
+- WRITE `t_typical` ≈ 3.44 μs
+- READ `t_typical` ≈ 5.04 μs
+
+Note: p99 tail latencies are expected to be higher (~100+ μs) because of ARM OS scheduling jitter. Record but do not optimize for tail latency in this experiment.
+
+### 14k. Bandwidth verification (Paths 6 and 7)
+
+Beyond latency, confirm that hardware offload is active by measuring bandwidth. Both paths should reach near-100 Gbps.
+
+```bash
+# Path 6: Host VF bandwidth
+# Server (tianjin)
+ib_write_bw -d mlx5_1 -F -s 65536 -D 10 &
+sleep 1
+# Client (fujian)
+ib_write_bw -d mlx5_1 -F -s 65536 -D 10 -x 3 <tianjin-100g-vf-ip> \
+  > ~/exp_data/A/path6_bw.log 2>&1
+pkill -f "ib_write_bw.*-D 10"
+sleep 2
+
+# Path 7: NIC ARM bandwidth
+ssh root@<tianjin-bf2-ip> "
+  pkill -f ib_write_bw 2>/dev/null
+  ib_write_bw -d ${TIANJIN_RDMA} -F -s 65536 -D 10 > /tmp/path7_bw_server.log 2>&1 &
+"
+sleep 2
+ssh root@<fujian-bf2-ip> "
+  ib_write_bw -d ${FUJIAN_RDMA} -F -s 65536 -D 10 -x 3 192.168.56.12
+" > ~/exp_data/A/path7_bw.log 2>&1
+ssh root@<tianjin-bf2-ip> "pkill -f ib_write_bw 2>/dev/null"
+```
+
+**Expected**:
+- Path 6: ~100 Gbps
+- Path 7: ~85 Gbps (ARM libibverbs has slightly higher per-packet overhead)
+
+### 14l. Troubleshooting Experiment A
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Path 1 comch_pingpong hangs | BF-2 Comch server not running | Check BF-2 log; ensure DOCA service running |
+| Path 1 typical ≠ ~29 μs | Non-release DOCA build or different PCIe gen | Verify `ibv_devinfo` shows PCIe Gen4; rebuild comch_pingpong in release mode |
+| Path 6/7 "Failed to modify QP to RTR" | SF mismatch or GID missing | Re-run `bf2_rdma_setup.sh`; check `show_gids` |
+| Path 7 only gets < 1 MB/s bandwidth | OVS NORMAL not hw-offloaded | Check `tc -s filter show dev p1 ingress \| grep in_hw`; if missing, restart OVS after setting `hw-offload=true` |
+| Path 7 IPv4 GID missing | SF netdev IP not assigned | `ip addr add 192.168.56.12/24 dev enp3s0f1s0` then `ip link set enp3s0f1s0 up` |
+| p99 tail latency >> typical | ARM OS scheduler jitter | Normal; record `t_typical` (median) as the key number, not avg |
+
+### 14m. Data consolidation
+
+Create a simple consolidation script that extracts the key numbers from all logs:
+
+```bash
+cd ~/exp_data/A
+cat > consolidate.sh << 'EOF'
+#!/bin/bash
+echo "Path  Size  t_min  t_typical  t_avg  t_max  p99  p99.9"
+
+# Path 1 (comch)
+for size in 64 256 1024; do
+  if [ -f path1_${size}.log ]; then
+    # Adjust grep patterns based on actual comch_pingpong output format
+    grep -E "min|median|avg|max|p99" path1_${size}.log | \
+      awk -v p="1" -v s="${size}" 'NR==1{printf "%s  %s  ", p, s} {printf "%s  ", $NF} END{print ""}'
+  fi
+done
+
+# Paths 2-5 (sockperf): sockperf prints a percentiles table
+for p in 2 3 4 5; do
+  for size in 64 256 1024; do
+    if [ -f path${p}_${size}.log ]; then
+      t_typical=$(grep "percentile 50.000" path${p}_${size}.log | awk '{print $NF}')
+      t_avg=$(grep "avg-latency" path${p}_${size}.log | awk '{print $NF}')
+      t_p99=$(grep "percentile 99.000" path${p}_${size}.log | awk '{print $NF}')
+      t_p999=$(grep "percentile 99.900" path${p}_${size}.log | awk '{print $NF}')
+      t_min=$(grep "min-latency" path${p}_${size}.log | awk '{print $NF}')
+      t_max=$(grep "max-latency" path${p}_${size}.log | awk '{print $NF}')
+      echo "${p}  ${size}  ${t_min}  ${t_typical}  ${t_avg}  ${t_max}  ${t_p99}  ${t_p999}"
+    fi
+  done
+done
+
+# Paths 6, 7 (perftest): output columns are t_min, t_max, t_typical, t_avg, t_stdev, p99, p999
+for p in 6 7; do
+  for type in write read; do
+    f=path${p}_${type}_64.log
+    if [ -f $f ]; then
+      line=$(awk '/^ [0-9]+ +[0-9]+ +[0-9]+\./ {print; exit}' $f)
+      echo "${p}_${type}  64  ${line}"
+    fi
+  done
+  # Bandwidth
+  fbw=path${p}_bw.log
+  if [ -f $fbw ]; then
+    bw=$(awk '/^ +[0-9]+ +[0-9]+ +[0-9]+\./ {print $4}' $fbw | tail -1)
+    echo "${p}  bw  -  -  -  -  -  ${bw} MB/s"
+  fi
+done
+EOF
+chmod +x consolidate.sh
+./consolidate.sh | tee path_summary.txt
+```
+
+**Expected findings table** (rough):
+
+```
+Path         Path description                    t_typical   Notes
+path1_64     Host↔local NIC (Comch)              ~29 μs     L1 baseline
+path2_64     Host↔host TCP eno1                  ~200 μs    1G mgmt network
+path3_64     Host↔host TCP 100G VF               ~80 μs     Kernel TCP over 100G
+path4_64     ARM↔ARM TCP OVS                     ~80 μs     Kernel TCP on ARM
+path5_64     Host↔host TCP OVS bridge            ~105 μs    Current baseline
+path6_write  Host VF RDMA write                  ~2 μs      Hardware lower bound
+path6_read   Host VF RDMA read                   ~3 μs      Hardware lower bound
+path7_write  ARM RDMA write (thesis)             ~3.44 μs   L2 core measurement
+path7_read   ARM RDMA read (thesis)              ~5.04 μs   L2 core measurement
+path6_bw     Host VF write bandwidth             ~95 Gbps
+path7_bw     ARM write bandwidth                 ~85 Gbps
+```
+
+**Derived end-to-end latency**: $T_{e2e} = 2 \times T_{Path1} + T_{Path7} \approx 2 \times 29 + 3.44 \approx 62\,\mu s$.
+
+**Speedup over Path 5 (existing baseline)**: $\alpha = 105 / 62 \approx 1.69x$.
+
+**Paste `path_summary.txt` back** for inclusion in Chapter 2's Experiment A analysis.
+
+### 14n. Cleanup
+
+```bash
+# Stop any lingering servers on hosts
+pkill -f sockperf 2>/dev/null
+pkill -f "ib_write_lat" 2>/dev/null
+pkill -f "ib_read_lat" 2>/dev/null
+pkill -f "ib_write_bw" 2>/dev/null
+pkill -f comch_pingpong 2>/dev/null
+
+# Stop any lingering servers on BF-2 ARMs
+for bf2 in <tianjin-bf2-ip> <fujian-bf2-ip>; do
+  ssh root@${bf2} "
+    pkill -f sockperf 2>/dev/null
+    pkill -f 'ib_write_lat\|ib_read_lat\|ib_write_bw' 2>/dev/null
+    pkill -f comch_pingpong 2>/dev/null
+  "
+done
+```
+
+---
+
+## 15. Data Collection Summary
 
 After all experiments complete (Ch.3 + Ch.4), run this to collect all results:
 
@@ -1432,6 +1920,17 @@ After all experiments complete (Ch.3 + Ch.4), run this to collect all results:
 echo "============================================"
 echo "  FULL EXPERIMENT RESULTS SUMMARY"
 echo "============================================"
+
+echo ""
+echo "===== CHAPTER 2 ====="
+echo ""
+echo "=== Experiment A: Hierarchical Kernel-Bypass Tunnel Latency ==="
+if [ -f ~/exp_data/A/path_summary.txt ]; then
+  cat ~/exp_data/A/path_summary.txt
+else
+  echo "(path_summary.txt not found; listing raw logs)"
+  ls ~/exp_data/A/ 2>/dev/null | head
+fi
 
 echo ""
 echo "===== CHAPTER 3 ====="
@@ -1538,5 +2037,5 @@ echo "============================================"
 
 ## Reporting Back
 
-After all experiments, paste the output of Section 14 here verbatim.
+After all experiments, paste the output of Section 15 here verbatim.
 Include any compilation errors, runtime errors, or unexpected behavior.
