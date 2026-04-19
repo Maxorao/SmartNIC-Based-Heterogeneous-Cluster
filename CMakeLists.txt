@@ -148,9 +148,16 @@ if(BUILD_TARGET STREQUAL "HOST")
     add_subdirectory(control-plane/master)
     add_subdirectory(bench/metric_push)
     add_subdirectory(bench/mock_slave)
+    # e2e_host lives under bench/rdma_e2e and builds on HOST
+    add_subdirectory(bench/rdma_e2e)
 else()
     add_subdirectory(control-plane/slave)
     add_subdirectory(control-plane/watchdog)
+    # RDMA bridges + orchestrator agent only on BF2
+    add_subdirectory(control-plane/rdma_bridge)
+    add_subdirectory(control-plane/orchestrator_agent)
+    # e2e_nic lives under bench/rdma_e2e and builds on BF2
+    add_subdirectory(bench/rdma_e2e)
 endif()
 
 # Note: tunnel/, bench/latency_bench/, bench/gemm_bench/ keep their

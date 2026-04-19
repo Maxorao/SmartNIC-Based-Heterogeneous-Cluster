@@ -2,6 +2,7 @@
 # Other targets link against `cluster_proto` to use the generated code.
 
 set(PROTO_SRC "${CMAKE_CURRENT_SOURCE_DIR}/cluster.proto")
+set(OA_PROTO_SRC "${CMAKE_CURRENT_SOURCE_DIR}/orchestrator_agent.proto")
 
 # Output directory for generated files
 set(PROTO_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
@@ -54,4 +55,37 @@ if(TARGET gRPC::grpc++)
 elseif(GRPC_FOUND_VIA_PKGCONFIG)
     target_link_libraries(cluster_proto PUBLIC ${GRPC_LIBRARIES} ${Protobuf_LIBRARIES})
     target_include_directories(cluster_proto PUBLIC ${GRPC_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS})
+endif()
+
+# -----------------------------------------------------------------------
+# Orchestrator agent proto (separate library)
+# -----------------------------------------------------------------------
+
+set(OA_PROTO_SRCS "${PROTO_OUT_DIR}/orchestrator_agent.pb.cc")
+set(OA_PROTO_HDRS "${PROTO_OUT_DIR}/orchestrator_agent.pb.h")
+set(OA_GRPC_SRCS  "${PROTO_OUT_DIR}/orchestrator_agent.grpc.pb.cc")
+set(OA_GRPC_HDRS  "${PROTO_OUT_DIR}/orchestrator_agent.grpc.pb.h")
+
+add_custom_command(
+    OUTPUT ${OA_PROTO_SRCS} ${OA_PROTO_HDRS} ${OA_GRPC_SRCS} ${OA_GRPC_HDRS}
+    COMMAND ${PROTOC_PATH}
+        --proto_path=${CMAKE_CURRENT_SOURCE_DIR}
+        --cpp_out=${PROTO_OUT_DIR}
+        --grpc_out=${PROTO_OUT_DIR}
+        --plugin=protoc-gen-grpc=${GRPC_PLUGIN_PATH}
+        ${OA_PROTO_SRC}
+    DEPENDS ${OA_PROTO_SRC}
+    COMMENT "Generating C++ protobuf/gRPC stubs from orchestrator_agent.proto"
+)
+
+add_library(oa_proto STATIC
+    ${OA_PROTO_SRCS}
+    ${OA_GRPC_SRCS}
+)
+target_include_directories(oa_proto PUBLIC ${PROTO_OUT_DIR})
+if(TARGET gRPC::grpc++)
+    target_link_libraries(oa_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+elseif(GRPC_FOUND_VIA_PKGCONFIG)
+    target_link_libraries(oa_proto PUBLIC ${GRPC_LIBRARIES} ${Protobuf_LIBRARIES})
+    target_include_directories(oa_proto PUBLIC ${GRPC_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS})
 endif()

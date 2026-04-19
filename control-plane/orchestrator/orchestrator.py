@@ -40,6 +40,12 @@ except ImportError:
     psycopg2 = None
     print("WARNING: psycopg2 not installed, DB queries disabled", file=sys.stderr)
 
+try:
+    from agent_client import AgentClient, GRPC_AVAILABLE as _AGENT_AVAILABLE
+except ImportError:
+    AgentClient = None  # type: ignore
+    _AGENT_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Configuration data classes
 # ---------------------------------------------------------------------------
@@ -98,6 +104,9 @@ class OrchestratorConfig:
     nics: Dict[str, SmartNICConfig] = field(default_factory=dict)
     workloads: Dict[str, WorkloadConfig] = field(default_factory=dict)
     vips: Dict[str, str] = field(default_factory=dict)  # workload_name → VIP address
+    decision_log: Optional[str] = None  # CSV path for threshold-sweep analysis
+    use_local_agent: bool = False       # Use orchestrator_agent gRPC instead of SSH
+    agent_port: int = 50052             # Port of orchestrator_agent on BF2
 
 
 # ---------------------------------------------------------------------------
@@ -189,19 +198,102 @@ def measure_llc_miss_rate(ssh_target: Optional[str],
 # ---------------------------------------------------------------------------
 
 class MigrationManager:
-    """Executes blue-green migration of a workload to any SmartNIC."""
+    """Executes blue-green migration of a workload to any SmartNIC.
+
+    Transport selection per step:
+      - if use_local_agent=True and a gRPC agent is reachable on the BF2 → use it
+      - otherwise fall back to run_cmd() via two-hop SSH
+    """
 
     def __init__(self, src_node: NodeConfig, dst_nic: SmartNICConfig,
                  workload: WorkloadConfig, vip: str,
                  src_is_host: bool, log: logging.Logger,
-                 src_nic: Optional[SmartNICConfig] = None):
+                 src_nic: Optional[SmartNICConfig] = None,
+                 use_local_agent: bool = False, agent_port: int = 50052):
         self.src = src_node
         self.dst = dst_nic
         self.wl = workload
         self.vip = vip
         self.src_is_host = src_is_host
-        self.src_nic = src_nic  # set when source is a SmartNIC (re-migration)
+        self.src_nic = src_nic
         self.log = log
+        self.dst_agent: Optional[AgentClient] = None
+        self.src_nic_agent: Optional[AgentClient] = None
+        if use_local_agent and _AGENT_AVAILABLE:
+            self.dst_agent = AgentClient(self.dst.bf2_ip, agent_port)
+            if not self.dst_agent.ping():
+                self.log.warning(
+                    f"orchestrator_agent unreachable on {self.dst.bf2_ip}, "
+                    "falling back to SSH")
+                self.dst_agent = None
+            if src_nic:
+                self.src_nic_agent = AgentClient(src_nic.bf2_ip, agent_port)
+                if not self.src_nic_agent.ping():
+                    self.src_nic_agent = None
+
+    def _start_container_on_dst(self) -> Tuple[bool, str]:
+        if self.dst_agent and self.dst_agent.available():
+            return self.dst_agent.start_container(
+                name=f"{self.wl.name}-new",
+                image=self.wl.image,
+                network="host",
+                cpuset="",
+                extra_args=self.wl.docker_args.split() if self.wl.docker_args else [],
+            )
+        docker_cmd = (
+            f"docker rm -f {self.wl.name}-new 2>/dev/null; "
+            f"docker run -d --name {self.wl.name}-new --network=host "
+            f"{self.wl.docker_args} {self.wl.image}"
+        )
+        rc, out, err = run_cmd(docker_cmd, self.dst.bf2_ssh, timeout=60)
+        return (rc == 0), (out if rc == 0 else err)
+
+    def _stop_container_on_dst(self, name: str):
+        if self.dst_agent and self.dst_agent.available():
+            self.dst_agent.stop_container(name, force=True)
+        else:
+            run_cmd(f"docker rm -f {name}", self.dst.bf2_ssh)
+
+    def _health_check_dst(self) -> bool:
+        url = f"http://localhost:{self.wl.host_port}{self.wl.health_path}"
+        if self.dst_agent and self.dst_agent.available():
+            healthy, _attempts, _ms = self.dst_agent.health_check(
+                url, max_attempts=self.wl.health_timeout, interval_ms=1000)
+            return healthy
+        for _ in range(self.wl.health_timeout):
+            time.sleep(1)
+            rc, _, _ = run_cmd(f"curl -sf -o /dev/null {url}",
+                                self.dst.bf2_ssh, timeout=5)
+            if rc == 0:
+                return True
+        return False
+
+    def _vip_on_dst(self, action: str) -> bool:
+        if self.dst_agent and self.dst_agent.available():
+            ok, _err, _ms = self.dst_agent.switch_vip(
+                self.vip, self.dst.bf2_iface, action=action,
+                prefix_len=24, send_arp=(action == "add"))
+            return ok
+        cmd = f"ip addr {action} {self.vip}/24 dev {self.dst.bf2_iface}"
+        rc, _, _ = run_cmd(cmd + " 2>/dev/null", self.dst.bf2_ssh)
+        if action == "add" and rc == 0:
+            run_cmd(f"arping -c 3 -A -I {self.dst.bf2_iface} {self.vip} &>/dev/null &",
+                    self.dst.bf2_ssh)
+        return rc == 0 or rc == 2  # EEXIST is ok
+
+    def _vip_on_src(self, action: str):
+        if self.src_is_host:
+            cmd = f"sudo ip addr {action} {self.vip}/24 dev {self.src.host_iface}"
+            run_cmd(cmd + " 2>/dev/null", self.src.host_ssh)
+        elif self.src_nic:
+            if self.src_nic_agent and self.src_nic_agent.available():
+                self.src_nic_agent.switch_vip(
+                    self.vip, self.src_nic.bf2_iface, action=action,
+                    prefix_len=24, send_arp=(action == "add"))
+            else:
+                run_cmd(
+                    f"ip addr {action} {self.vip}/24 dev {self.src_nic.bf2_iface} 2>/dev/null",
+                    self.src_nic.bf2_ssh)
 
     def execute(self) -> Tuple[bool, Dict[str, float]]:
         """
@@ -211,75 +303,43 @@ class MigrationManager:
         timings = {}
         wl = self.wl
 
-        # --- Stage 1: Start new container on target SmartNIC ---
         t0 = time.monotonic()
-        self.log.info(f"[migrate] Starting {wl.name} on {self.dst.nic_id} ({self.dst.bf2_ip})")
-        docker_cmd = (
-            f"docker rm -f {wl.name}-new 2>/dev/null; "
-            f"docker run -d --name {wl.name}-new --network=host "
-            f"{wl.docker_args} {wl.image}"
-        )
-        rc, _, err = run_cmd(docker_cmd, self.dst.bf2_ssh, timeout=60)
-        if rc != 0:
-            self.log.error(f"[migrate] Container start failed: {err}")
+        self.log.info(f"[migrate] Start {wl.name} on {self.dst.nic_id} "
+                      f"({'agent' if self.dst_agent else 'ssh'})")
+        ok, detail = self._start_container_on_dst()
+        if not ok:
+            self.log.error(f"[migrate] Container start failed: {detail}")
             return False, timings
         timings["container_start"] = (time.monotonic() - t0) * 1000
 
-        # --- Stage 2: Health check ---
         t0 = time.monotonic()
-        self.log.info(f"[migrate] Health check on {self.dst.nic_id}...")
-        healthy = False
-        for attempt in range(wl.health_timeout):
-            time.sleep(1)
-            rc, _, _ = run_cmd(
-                f"curl -sf -o /dev/null http://localhost:{wl.host_port}{wl.health_path}",
-                self.dst.bf2_ssh, timeout=5
-            )
-            if rc == 0:
-                healthy = True
-                break
-
-        if not healthy:
+        if not self._health_check_dst():
             self.log.error(f"[migrate] Health check failed, aborting")
-            run_cmd(f"docker rm -f {wl.name}-new", self.dst.bf2_ssh)
+            self._stop_container_on_dst(f"{wl.name}-new")
             return False, timings
         timings["health_check"] = (time.monotonic() - t0) * 1000
 
-        # --- Stage 3: VIP atomic switch ---
         t0 = time.monotonic()
         self.log.info(f"[migrate] VIP switch: {self.vip} → {self.dst.nic_id}")
-
-        # Remove VIP from source
-        if self.src_is_host:
-            run_cmd(f"sudo ip addr del {self.vip}/24 dev {self.src.host_iface} 2>/dev/null",
-                    self.src.host_ssh)
-        elif self.src_nic:
-            # Source is another SmartNIC — remove VIP from the actual source
-            run_cmd(f"ip addr del {self.vip}/24 dev {self.src_nic.bf2_iface} 2>/dev/null",
-                    self.src_nic.bf2_ssh)
-
-        # Add VIP to destination SmartNIC
-        rc, _, err = run_cmd(f"ip addr add {self.vip}/24 dev {self.dst.bf2_iface}",
-                             self.dst.bf2_ssh)
-        if rc != 0:
-            self.log.error(f"[migrate] VIP add failed: {err}, rolling back")
-            if self.src_is_host:
-                run_cmd(f"sudo ip addr add {self.vip}/24 dev {self.src.host_iface}",
-                        self.src.host_ssh)
-            run_cmd(f"docker rm -f {wl.name}-new", self.dst.bf2_ssh)
+        self._vip_on_src("del")
+        if not self._vip_on_dst("add"):
+            self.log.error(f"[migrate] VIP add failed, rolling back")
+            self._vip_on_src("add")
+            self._stop_container_on_dst(f"{wl.name}-new")
             return False, timings
-
-        # Gratuitous ARP
-        run_cmd(f"arping -c 3 -A -I {self.dst.bf2_iface} {self.vip} &>/dev/null &",
-                self.dst.bf2_ssh)
         timings["vip_switch"] = (time.monotonic() - t0) * 1000
 
-        # --- Stage 4: Stop old container ---
         t0 = time.monotonic()
         if self.src_is_host:
             run_cmd(f"docker rm -f {wl.name}", self.src.host_ssh)
-        # Rename new container
-        run_cmd(f"docker rename {wl.name}-new {wl.name}", self.dst.bf2_ssh)
+        # Rename new container to canonical name
+        if self.dst_agent and self.dst_agent.available():
+            # agent has no rename rpc; use docker command via ssh as fallback
+            run_cmd(f"docker rename {wl.name}-new {wl.name}",
+                    self.dst.bf2_ssh)
+        else:
+            run_cmd(f"docker rename {wl.name}-new {wl.name}",
+                    self.dst.bf2_ssh)
         timings["old_cleanup"] = (time.monotonic() - t0) * 1000
 
         total = sum(timings.values())
@@ -380,6 +440,42 @@ class Orchestrator:
         # Track current workload placement: workload_name → nic_id (or None if on host)
         self.placement: Dict[str, Optional[str]] = {}
 
+        # Decision log file handle (for threshold sensitivity analysis)
+        self.decision_log_fp = None
+        self.dry_run = False
+        if config.decision_log:
+            os.makedirs(os.path.dirname(os.path.abspath(config.decision_log)),
+                        exist_ok=True)
+            self.decision_log_fp = open(config.decision_log, "a")
+            # Write header if empty
+            if os.path.getsize(config.decision_log) == 0:
+                self.decision_log_fp.write(
+                    "timestamp_ns,node_uuid,sample_llc,window_avg_llc,"
+                    "baseline_llc,theta_llc_factor,threshold_llc,"
+                    "above_threshold,decision\n")
+                self.decision_log_fp.flush()
+
+    def __del__(self):
+        try:
+            if self.decision_log_fp:
+                self.decision_log_fp.close()
+        except Exception:
+            pass
+
+    def log_decision(self, uid: str, sample_llc: float, window_avg: float,
+                     baseline: float, threshold: float, above: bool,
+                     decision: str):
+        """Record one scheduling decision for threshold sensitivity analysis."""
+        if not self.decision_log_fp:
+            return
+        import time as _t
+        ts = int(_t.time_ns())
+        self.decision_log_fp.write(
+            f"{ts},{uid},{sample_llc:.6f},{window_avg:.6f},"
+            f"{baseline:.6f},{self.cfg.thresholds.llc_factor:.3f},"
+            f"{threshold:.6f},{int(above)},{decision}\n")
+        self.decision_log_fp.flush()
+
     # --- DB connection ---
 
     def connect_db(self):
@@ -427,19 +523,30 @@ class Orchestrator:
 
             # Need at least 2 samples for reliable average
             if len(self.llc_window[uid]) < 2:
+                # Log even with short window for sensitivity study
+                self.log_decision(uid, rate, rate,
+                                  self.node_baselines.get(uid, 0.18),
+                                  self.node_baselines.get(uid, 0.18) * th.llc_factor,
+                                  False, "insufficient_window")
                 continue
 
             avg_llc = sum(self.llc_window[uid]) / len(self.llc_window[uid])
             baseline = self.node_baselines.get(uid, 0.18)
             threshold = baseline * th.llc_factor
 
-            if avg_llc > threshold:
+            above = avg_llc > threshold
+            if above:
                 self.log.warning(
                     f"[P1] {uid}: avg LLC={avg_llc:.4f} > threshold={threshold:.4f} "
                     f"(window={len(self.llc_window[uid])} samples)")
                 interfered_nodes.append(uid)
+                decision = "interference_detected"
             else:
                 self.log.debug(f"[P1] {uid}: avg LLC={avg_llc:.4f} OK")
+                decision = "no_interference"
+
+            self.log_decision(uid, rate, avg_llc, baseline, threshold,
+                              above, decision)
 
         return interfered_nodes
 
@@ -564,6 +671,8 @@ class Orchestrator:
                 src_is_host=(current_nic_id is None),
                 log=self.log,
                 src_nic=src_nic,
+                use_local_agent=self.cfg.use_local_agent,
+                agent_port=self.cfg.agent_port,
             )
             success, timings = mgr.execute()
 
@@ -592,6 +701,10 @@ class Orchestrator:
         # Phase 1
         interfered = self.phase1_detect_interference()
         if not interfered:
+            return
+
+        if self.dry_run:
+            self.log.info(f"[dry-run] would evaluate migration for {interfered}")
             return
 
         # Phase 2
@@ -726,6 +839,15 @@ def main():
                         help="Sliding window sample count (default: 6)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--decision-log", default=None,
+                        help="CSV file to record every phase-1 decision "
+                             "(for threshold sensitivity analysis)")
+    parser.add_argument("--use-local-agent", action="store_true",
+                        help="Use orchestrator_agent gRPC on BF2 instead of SSH")
+    parser.add_argument("--agent-port", type=int, default=50052,
+                        help="Port of orchestrator_agent on BF2 (default 50052)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Log decisions but skip phases 2-4 (no migration)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -741,8 +863,12 @@ def main():
     cfg.thresholds.llc_factor = args.llc_threshold
     cfg.perf_duration = args.perf_duration
     cfg.window_size = args.window_size
+    cfg.decision_log = args.decision_log
+    cfg.use_local_agent = args.use_local_agent
+    cfg.agent_port = args.agent_port
 
     orch = Orchestrator(cfg)
+    orch.dry_run = args.dry_run
 
     if args.llc_baseline > 0:
         for uid in cfg.nodes:

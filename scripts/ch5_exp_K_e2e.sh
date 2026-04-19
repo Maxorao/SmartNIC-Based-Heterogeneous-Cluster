@@ -256,6 +256,11 @@ echo "[K.3] Done. Results: k3_gemm.txt, k3_wrk.txt, k3_perf.txt"
 # =========================================================================
 cleanup_all
 
+# ── Emit machine-readable summary for run_repeated.sh ─────────────────────────
+SUMMARY_CSV="${SUMMARY_CSV:-${OUT_DIR}/summary.csv}"
+python3 "${SCRIPT_DIR}/analyze/emit_summary.py" \
+    --exp K --data-dir "${OUT_DIR}" --out "${SUMMARY_CSV}" || true
+
 echo ""
 echo "============================================================"
 echo " Experiment K Complete"

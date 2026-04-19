@@ -86,6 +86,11 @@ ssh ${USER}@${FUJIAN_IP} "cat /tmp/perf_h3.txt" > "${OUT_DIR}/h3_perf.txt"
 ssh ${USER}@${FUJIAN_IP} "ssh root@${BF_IP} 'docker rm -f nginx-bench'"
 echo "H.3 done."
 
+# ── Emit machine-readable summary for run_repeated.sh ─────────────────────────
+SUMMARY_CSV="${SUMMARY_CSV:-${OUT_DIR}/summary.csv}"
+python3 "${SCRIPT_DIR}/analyze/emit_summary.py" \
+    --exp H --data-dir "${OUT_DIR}" --out "${SUMMARY_CSV}" || true
+
 echo ""
 echo "=== Experiment H Complete ==="
 echo "Compare GFLOPS, LLC miss rate, and context switches across H.1/H.2/H.3"

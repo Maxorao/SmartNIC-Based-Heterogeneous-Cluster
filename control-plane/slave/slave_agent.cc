@@ -40,10 +40,13 @@
 
 #include "bf2_collector.h"
 #include "host_collector.h"
+#include "rdma_uds_client.h"
 
 extern "C" {
 #include "../../common/timing.h"
 #include "../../common/node_state.h"
+#include "../../common/protocol.h"
+#include "../rdma_bridge/rdma_bridge_common.h"
 }
 
 using grpc::Channel;
@@ -103,6 +106,10 @@ struct Config {
     uint32_t    heartbeat_ms  = 3000;
     uint32_t    report_ms     = 3000;
     uint32_t    bf2_report_ms = 5000;
+    /* RDMA bridge hot-path (optional): if set, ResourceReport messages are
+     * forwarded to this UDS in addition to (or instead of) the gRPC stream. */
+    std::string rdma_uds      = "";
+    bool        rdma_only     = false;   /* if true, skip gRPC for ResourceReport */
 };
 
 /* ------------------------------------------------------------------ */
@@ -179,6 +186,8 @@ static Config parse_args(int argc, char* argv[])
         {"heartbeat-ms",  required_argument, nullptr, 'h'},
         {"report-ms",     required_argument, nullptr, 'R'},
         {"bf2-report-ms", required_argument, nullptr, 'b'},
+        {"rdma-uds",      required_argument, nullptr, 'U'},
+        {"rdma-only",     no_argument,       nullptr, 'O'},
         {"help",          no_argument,       nullptr, 'H'},
         {nullptr, 0, nullptr, 0}
     };
@@ -194,6 +203,8 @@ static Config parse_args(int argc, char* argv[])
         case 'h': cfg.heartbeat_ms = static_cast<uint32_t>(atoi(optarg)); break;
         case 'R': cfg.report_ms    = static_cast<uint32_t>(atoi(optarg)); break;
         case 'b': cfg.bf2_report_ms = static_cast<uint32_t>(atoi(optarg)); break;
+        case 'U': cfg.rdma_uds     = optarg; break;
+        case 'O': cfg.rdma_only    = true; break;
         case 'H':
         default:
             fprintf(stderr,
@@ -205,10 +216,19 @@ static Config parse_args(int argc, char* argv[])
                 "  --rep-pci=ADDR          Host representor PCI (default: auto)\n"
                 "  --heartbeat-ms=N        Heartbeat interval (default: 3000)\n"
                 "  --report-ms=N           Host report interval (default: 3000)\n"
-                "  --bf2-report-ms=N       BF2 report interval (default: 5000)\n",
+                "  --bf2-report-ms=N       BF2 report interval (default: 5000)\n"
+                "  --rdma-uds=PATH         Forward ResourceReports to this UDS\n"
+                "                          (rdma_bridge_slave endpoint)\n"
+                "  --rdma-only             Skip gRPC stream for ResourceReport\n"
+                "                          (requires --rdma-uds)\n",
                 argv[0]);
             exit(c == 'H' ? 0 : 1);
         }
+    }
+
+    if (cfg.rdma_only && cfg.rdma_uds.empty()) {
+        fprintf(stderr, "--rdma-only requires --rdma-uds\n");
+        exit(1);
     }
 
     if (cfg.node_uuid.empty())
@@ -333,6 +353,39 @@ static NodeMessage make_resource_report(const std::string& uuid,
     return nm;
 }
 
+/*
+ * Build an RDMA-bridge-formatted ResourceReport (binary protocol from
+ * common/protocol.h) with a bridge_hdr_t prefix. Returns total bytes written.
+ */
+static uint32_t build_bridge_resource_report(uint8_t* buf, uint32_t cap,
+                                             const std::string& uuid,
+                                             const HostCollector::HostMetrics& hm,
+                                             uint32_t seq)
+{
+    uint32_t total = sizeof(bridge_hdr_t) + sizeof(resource_report_t);
+    if (cap < total) return 0;
+
+    bridge_hdr_t* h = reinterpret_cast<bridge_hdr_t*>(buf);
+    h->magic   = BRIDGE_MAGIC;
+    h->type    = BRIDGE_MSG_RESOURCE_REPORT;
+    h->flags   = 0;
+    h->len     = static_cast<uint16_t>(sizeof(resource_report_t));
+    h->seq     = seq;
+    h->ts_ns_lo = static_cast<uint32_t>(unix_ns() & 0xFFFFFFFFu);
+
+    resource_report_t* rr =
+        reinterpret_cast<resource_report_t*>(buf + sizeof(bridge_hdr_t));
+    memset(rr, 0, sizeof(*rr));
+    strncpy(rr->node_id, uuid.c_str(), sizeof(rr->node_id) - 1);
+    rr->timestamp_ns   = hm.timestamp_ns;
+    rr->cpu_usage_pct  = hm.cpu_pct;
+    rr->mem_total_kb   = hm.mem_total_kb;
+    rr->mem_avail_kb   = hm.mem_avail_kb;
+    rr->net_rx_bytes   = hm.net_rx_bytes;
+    rr->net_tx_bytes   = hm.net_tx_bytes;
+    return total;
+}
+
 static NodeMessage make_bf2_report(const std::string& uuid,
                                     const BF2Collector::BF2Metrics& bm)
 {
@@ -409,6 +462,16 @@ int main(int argc, char* argv[])
 
     BF2Collector bf2_collector;
     bf2_collector.init();
+
+    // ---- Init RDMA UDS client (optional hot-path) ----
+
+    RdmaUdsClient rdma_uds;
+    if (!cfg.rdma_uds.empty()) {
+        rdma_uds.configure(cfg.rdma_uds);
+        sa_log("RDMA hot-path UDS: %s (rdma-only=%s)",
+               cfg.rdma_uds.c_str(), cfg.rdma_only ? "yes" : "no");
+    }
+    uint32_t rdma_report_seq = 0;
 
     // ---- Main reconnection loop ----
 
@@ -520,11 +583,23 @@ int main(int argc, char* argv[])
                 if (host_alive) {
                     auto hm = host_collector.getLatest();
                     if (hm.valid) {
-                        NodeMessage rr = make_resource_report(cfg.node_uuid, hm);
-                        if (!stream->Write(rr)) {
-                            sa_log("failed to write ResourceReport");
-                            stream_ok.store(false);
-                            break;
+                        /* Optional RDMA hot-path: send via bridge UDS */
+                        if (rdma_uds.is_configured()) {
+                            uint8_t bbuf[sizeof(bridge_hdr_t) +
+                                         sizeof(resource_report_t)];
+                            uint32_t tlen = build_bridge_resource_report(
+                                bbuf, sizeof(bbuf), cfg.node_uuid, hm,
+                                rdma_report_seq++);
+                            (void)rdma_uds.send(bbuf, tlen);
+                        }
+                        /* gRPC stream path (skipped if --rdma-only) */
+                        if (!cfg.rdma_only) {
+                            NodeMessage rr = make_resource_report(cfg.node_uuid, hm);
+                            if (!stream->Write(rr)) {
+                                sa_log("failed to write ResourceReport");
+                                stream_ok.store(false);
+                                break;
+                            }
                         }
                     }
                 }

@@ -127,5 +127,11 @@ for s in 1 2 3; do
         echo "  Scenario ${s}: avg GFLOPS = ${avg}"
     fi
 done
+
+# ── Emit machine-readable summary for run_repeated.sh ─────────────────────────
+SUMMARY_CSV="${SUMMARY_CSV:-${DATA_DIR}/B/summary.csv}"
+python3 "${SCRIPT_DIR}/analyze/emit_summary.py" \
+    --exp B --data-dir "${DATA_DIR}/B" --out "${SUMMARY_CSV}" || true
+
 echo ""
 echo "Run: python3 ${SCRIPT_DIR}/analyze/analyze_B.py"

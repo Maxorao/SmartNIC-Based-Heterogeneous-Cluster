@@ -6,11 +6,13 @@ add_executable(slave_agent
     slave_agent.cc
     bf2_collector.cc
     host_collector.cc
+    rdma_uds_client.cc
 )
 
 target_include_directories(slave_agent PRIVATE
     ${CMAKE_SOURCE_DIR}/tunnel
     ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/control-plane/rdma_bridge
     ${DOCA_INC_DIR}
 )
 

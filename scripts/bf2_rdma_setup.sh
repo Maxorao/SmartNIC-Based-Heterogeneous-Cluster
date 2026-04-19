@@ -19,17 +19,28 @@ set -e
 BF_ROLE="${BF_ROLE:-A}"
 
 if [ "$BF_ROLE" = "A" ]; then
+  # tianjin BF2 (master)
   SF_NETDEV="enp3s0f1s0"
   SF_REPRESENTOR="en3f1pf1sf0"
-  SF_IP="192.168.56.12/24"
+  SF_IP="192.168.56.102/24"
   RDMA_DEV_HINT="mlx5_3"
+  UPLINK_PORT="p1"
 elif [ "$BF_ROLE" = "B" ]; then
+  # fujian BF2 (worker 1)
   SF_NETDEV="enp3s0f1s2"
   SF_REPRESENTOR="en3f1pf1sf2"
-  SF_IP="192.168.56.13/24"
+  SF_IP="192.168.56.103/24"
   RDMA_DEV_HINT="mlx5_2"
+  UPLINK_PORT="p1"
+elif [ "$BF_ROLE" = "C" ]; then
+  # helong BF2 (worker 2) — uses p0 uplink instead of p1
+  SF_NETDEV="enp3s0f0s4"
+  SF_REPRESENTOR="en3f0pf0sf4"
+  SF_IP="192.168.56.101/24"
+  RDMA_DEV_HINT="mlx5_0"
+  UPLINK_PORT="p0"
 else
-  echo "Error: BF_ROLE must be A or B"
+  echo "Error: BF_ROLE must be A (tianjin-BF2), B (fujian-BF2), or C (helong-BF2)"
   exit 1
 fi
 
@@ -39,6 +50,7 @@ echo "  角色:         $BF_ROLE"
 echo "  SF netdev:    $SF_NETDEV"
 echo "  SF 代表口:    $SF_REPRESENTOR"
 echo "  SF IP:        $SF_IP"
+echo "  上行物理口:   $UPLINK_PORT"
 echo "  预期 RDMA 设备: $RDMA_DEV_HINT"
 echo "=========================================="
 

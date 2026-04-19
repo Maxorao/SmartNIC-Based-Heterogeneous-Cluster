@@ -1,0 +1,86 @@
+// Orchestrator agent service — runs on each BF2 to execute migration
+// commands locally, replacing two-hop SSH.
+//
+// orchestrator.py (tianjin host) connects to each BF2 ARM at its 100G
+// fabric IP (192.168.56.1/2/3) on port 50052.
+
+syntax = "proto3";
+package orchestrator_agent;
+
+service OrchestratorAgent {
+  rpc StartContainer(StartContainerRequest) returns (ContainerResponse);
+  rpc StopContainer(StopContainerRequest) returns (ContainerResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc SwitchVip(SwitchVipRequest) returns (SwitchVipResponse);
+  rpc RunPerf(RunPerfRequest) returns (RunPerfResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message StartContainerRequest {
+  string name           = 1;   // Container name
+  string image          = 2;   // Docker image
+  string network        = 3;   // Network mode (default "host")
+  string cpuset         = 4;   // --cpuset-cpus (optional)
+  repeated string extra_args = 5;
+}
+
+message StopContainerRequest {
+  string name = 1;
+  bool   force = 2;             // docker rm -f
+}
+
+message ContainerResponse {
+  bool   success     = 1;
+  string container_id = 2;
+  string error       = 3;
+  uint64 duration_ms = 4;
+}
+
+message HealthCheckRequest {
+  string target_url   = 1;    // e.g. "http://localhost:80/"
+  uint32 max_attempts = 2;    // default 30
+  uint32 interval_ms  = 3;    // default 1000
+}
+
+message HealthCheckResponse {
+  bool   healthy      = 1;
+  uint32 attempts     = 2;
+  uint64 duration_ms  = 3;
+  string error        = 4;
+}
+
+message SwitchVipRequest {
+  string vip          = 1;    // e.g. "192.168.56.200"
+  uint32 prefix_len   = 2;    // default 24
+  string action       = 3;    // "add" or "del"
+  string interface    = 4;    // e.g. "p1"
+  bool   send_arp     = 5;    // send gratuitous ARP after add
+}
+
+message SwitchVipResponse {
+  bool   success      = 1;
+  string error        = 2;
+  uint64 duration_ms  = 3;
+}
+
+message RunPerfRequest {
+  string events       = 1;    // e.g. "LLC-load-misses,LLC-loads"
+  double duration_s   = 2;
+  string target_pid   = 3;    // optional, "" for system-wide
+}
+
+message RunPerfResponse {
+  bool               success = 1;
+  map<string, uint64> counters = 2;
+  string             raw_output = 3;
+}
+
+message PingRequest {
+  uint64 client_timestamp_ns = 1;
+}
+
+message PingResponse {
+  uint64 server_timestamp_ns = 1;
+  string hostname            = 2;
+  string version             = 3;
+}
