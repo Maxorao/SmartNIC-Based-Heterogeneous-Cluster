@@ -14,14 +14,17 @@ if(NOT IBVERBS_LIB OR NOT RDMACM_LIB)
 endif()
 
 # rdma_transport object (shared C source between e2e_host/e2e_nic/bridges)
-add_library(rdma_transport STATIC
-    ${CMAKE_SOURCE_DIR}/common/rdma_transport.c
-)
-target_include_directories(rdma_transport PUBLIC
-    ${CMAKE_SOURCE_DIR}/common
-)
-target_link_libraries(rdma_transport PUBLIC ${IBVERBS_LIB} ${RDMACM_LIB})
-target_compile_options(rdma_transport PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+# Guard: on BF2 builds, rdma_bridge may already define this target
+if(NOT TARGET rdma_transport)
+    add_library(rdma_transport STATIC
+        ${CMAKE_SOURCE_DIR}/common/rdma_transport.c
+    )
+    target_include_directories(rdma_transport PUBLIC
+        ${CMAKE_SOURCE_DIR}/common
+    )
+    target_link_libraries(rdma_transport PUBLIC ${IBVERBS_LIB} ${RDMACM_LIB})
+    target_compile_options(rdma_transport PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+endif()
 
 if(BUILD_TARGET STREQUAL "HOST")
     # Host-side binary: uses Comch host library

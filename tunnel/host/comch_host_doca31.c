@@ -69,30 +69,24 @@ static doca_error_t open_dev_by_pci(const char *pci_str, struct doca_dev **dev_o
     *dev_out = NULL;
 
     res = doca_devinfo_create_list(&devs, &nb);
-    if (res != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("doca_devinfo_create_list: %s", doca_error_get_name(res));
+    if (res != DOCA_SUCCESS)
         return res;
-    }
 
     for (uint32_t i = 0; i < nb; i++) {
         if (doca_devinfo_get_pci_addr_str(devs[i], addr) != DOCA_SUCCESS)
             continue;
 
         /* pci_addr_str returns "XX:XX.X" with leading zeros */
-        bool match = false;
-        if (strcmp(pci_str, "auto") == 0) {
-            /* pick the first device that supports comch client */
+        bool match;
+        if (strcmp(pci_str, "auto") == 0)
             match = (doca_comch_cap_client_is_supported(devs[i]) == DOCA_SUCCESS);
-        } else {
+        else
             match = (strcasecmp(addr, pci_str) == 0);
-        }
 
         if (match) {
             res = doca_dev_open(devs[i], dev_out);
-            if (res == DOCA_SUCCESS) {
-                DOCA_LOG_INFO("Opened host device %s", addr);
+            if (res == DOCA_SUCCESS)
                 found = true;
-            }
             break;
         }
     }
@@ -192,7 +186,7 @@ doca_error_t comch_host_init(comch_host_ctx_t **ctx_out,
     /* 1. Open the BF PF device on the host */
     res = open_dev_by_pci(pci_addr, &ctx->dev);
     if (res != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Cannot open device '%s': %s", pci_addr, doca_error_get_name(res));
+        DOCA_LOG_ERR("open_dev_by_pci('%s'): %s", pci_addr, doca_error_get_name(res));
         goto err_free;
     }
 
@@ -206,7 +200,8 @@ doca_error_t comch_host_init(comch_host_ctx_t **ctx_out,
     /* 3. Create Comch client (service_name is the connection key) */
     res = doca_comch_client_create(ctx->dev, service_name, &ctx->client);
     if (res != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("doca_comch_client_create: %s", doca_error_get_name(res));
+        DOCA_LOG_ERR("doca_comch_client_create('%s'): %s",
+                     service_name, doca_error_get_name(res));
         goto err_pe;
     }
 
@@ -276,7 +271,7 @@ doca_error_t comch_host_init(comch_host_ctx_t **ctx_out,
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (now.tv_sec > deadline.tv_sec ||
             (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-            DOCA_LOG_ERR("Connection timeout (5 s) — is forward_routine running?");
+            DOCA_LOG_ERR("Comch client connect timeout (5s)");
             res = DOCA_ERROR_TIME_OUT;
             goto err_client;
         }

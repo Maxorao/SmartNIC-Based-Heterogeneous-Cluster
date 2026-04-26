@@ -172,6 +172,18 @@ static int run_ponger(const char* pci_addr, const char* service)
     fprintf(stderr, "[ponger] comch connected (pci=%s, service=%s)\n",
             pci_addr, service);
 
+    /* Send a hello so the BF2 server registers our Comch peer_addr.
+     * The DOCA 1.5 Comm Channel on BF2 only populates peer_addr on the first
+     * successful recv — without this, the BF2 cannot send to us. */
+    char hello[sizeof(msg_header_t) + 8];
+    int hlen = proto_build(hello, sizeof(hello), MSG_BENCH_PING, 0,
+                            "PONGER", 6);
+    if (comch_host_send(ctx, hello, hlen) != DOCA_SUCCESS) {
+        fprintf(stderr, "[ponger] hello send failed\n");
+    } else {
+        fprintf(stderr, "[ponger] sent hello to BF2\n");
+    }
+
     char buf[sizeof(msg_header_t) + PROTO_MAX_PAYLOAD];
     uint64_t count = 0;
     while (g_running) {
@@ -202,7 +214,7 @@ int main(int argc, char** argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    mode_t mode = MODE_PINGER;
+    e2e_mode_t mode = MODE_PINGER;
     const char* pci_addr = "auto";
     const char* service = DEFAULT_SERVICE;
     const char* out_path = NULL;

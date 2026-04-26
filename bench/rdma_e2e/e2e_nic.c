@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <inttypes.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "../../common/protocol.h"
 #include "../../common/timing.h"
@@ -53,6 +54,23 @@ static volatile int g_running = 1;
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
 typedef enum { NIC_CLIENT, NIC_SERVER } nic_mode_t;
+
+struct rdma_accept_args {
+    const char*       bind_ip;
+    uint16_t          port;
+    uint32_t          msg_size;
+    rdma_endpoint_t*  result;
+    volatile int      done;
+};
+
+static void* rdma_accept_thread(void* a)
+{
+    struct rdma_accept_args* aa = (struct rdma_accept_args*)a;
+    aa->result = rdma_endpoint_create_server(aa->bind_ip, aa->port,
+                                              aa->msg_size, RECV_DEPTH);
+    __atomic_store_n(&aa->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
 
 static int run_client(const char* dev_pci, const char* rep_pci,
                        const char* peer_ip, uint16_t port,
@@ -119,46 +137,76 @@ static int run_server(const char* dev_pci, const char* rep_pci,
     comch_nic_ctx_t* cctx = NULL;
     rdma_endpoint_t* rep = NULL;
 
-    fprintf(stderr, "[nic-server] starting RDMA server on %s:%u ...\n",
-            bind_ip ? bind_ip : "*", port);
-    rep = rdma_endpoint_create_server(bind_ip, port, msg_size, RECV_DEPTH);
-    if (!rep) {
-        fprintf(stderr, "rdma_endpoint_create_server failed\n"); return 1;
-    }
-    fprintf(stderr, "[nic-server] RDMA connection established. Starting Comch...\n");
-
+    /* Init Comch FIRST so the host can connect immediately. Initializing the
+     * RDMA listener before Comch was observed to prevent the host's Comch
+     * client from completing its handshake on the BF2. The host's Comch
+     * connection also needs the BF2 PE to be progressed (via comch_nic_recv);
+     * since rdma_endpoint_create_server blocks until the peer BF2 connects,
+     * we run it in a worker thread and pump Comch recv in the main thread
+     * so the host can attach. */
+    fprintf(stderr, "[nic-server] starting Comch listener (service=%s)...\n", service);
     if (comch_nic_init(&cctx, dev_pci, rep_pci, service) != DOCA_SUCCESS) {
-        fprintf(stderr, "comch_nic_init failed\n");
-        rdma_endpoint_destroy(rep);
+        fprintf(stderr, "comch_nic_init failed\n"); return 1;
+    }
+
+    struct rdma_accept_args args = { bind_ip, port, msg_size, NULL, 0 };
+
+    pthread_t rdma_thr;
+    fprintf(stderr, "[nic-server] starting RDMA server on %s:%u (background) ...\n",
+            bind_ip ? bind_ip : "*", port);
+    pthread_create(&rdma_thr, NULL, rdma_accept_thread, &args);
+
+    /* Pump Comch PE so the host can finish its handshake. We don't actually
+     * want any data yet — just a recv with a small timeout to drive the PE. */
+    uint8_t pump_buf[64];
+    while (!__atomic_load_n(&args.done, __ATOMIC_ACQUIRE) && g_running) {
+        size_t l = sizeof(pump_buf);
+        (void)comch_nic_recv_blocking(cctx, pump_buf, &l, 100);
+    }
+    pthread_join(rdma_thr, NULL);
+    rep = args.result;
+    if (!rep) {
+        fprintf(stderr, "rdma_endpoint_create_server failed\n");
+        comch_nic_destroy(cctx);
         return 1;
     }
-    fprintf(stderr, "[nic-server] ready. Forwarding RDMA<->Comch...\n");
+    fprintf(stderr, "[nic-server] RDMA connection established. Forwarding RDMA<->Comch...\n");
 
     uint8_t* buf = malloc(msg_size);
     if (!buf) { fprintf(stderr, "malloc failed\n"); return 1; }
 
+    /* Main loop: alternate RDMA and Comch polls with short timeouts so the
+     * host's Comch handshake can complete (DOCA Comch on BF2 only progresses
+     * its connection state machine when recvfrom is called). */
     uint64_t forwarded = 0;
     while (g_running) {
+        /* 1. Poll RDMA briefly (50ms) for a message from peer BF2. */
         uint32_t rlen = 0;
-        int rc = rdma_endpoint_recv(rep, buf, msg_size, &rlen, 2000000);
-        if (rc != 0) continue;
+        int rc = rdma_endpoint_recv(rep, buf, msg_size, &rlen, 50000);
 
-        if (comch_nic_send(cctx, buf, rlen) != DOCA_SUCCESS) {
-            fprintf(stderr, "[nic-server] comch send fail\n"); continue;
+        if (rc == 0) {
+            /* Got an RDMA message — forward to host via Comch. */
+            if (comch_nic_send(cctx, buf, rlen) != DOCA_SUCCESS) {
+                fprintf(stderr, "[nic-server] comch send fail\n"); continue;
+            }
+            size_t clen = msg_size;
+            if (comch_nic_recv_blocking(cctx, buf, &clen, 2000) != DOCA_SUCCESS) {
+                fprintf(stderr, "[nic-server] comch recv timeout\n"); continue;
+            }
+            if (rdma_endpoint_send(rep, buf, (uint32_t)clen) != 0) {
+                fprintf(stderr, "[nic-server] rdma send fail\n"); continue;
+            }
+            forwarded++;
+            if ((forwarded & 0xFFF) == 0) {
+                fprintf(stderr, "[nic-server] forwarded %" PRIu64 "\r", forwarded);
+            }
+            continue;
         }
 
-        size_t clen = msg_size;
-        if (comch_nic_recv_blocking(cctx, buf, &clen, 2000) != DOCA_SUCCESS) {
-            fprintf(stderr, "[nic-server] comch recv timeout\n"); continue;
-        }
-
-        if (rdma_endpoint_send(rep, buf, (uint32_t)clen) != 0) {
-            fprintf(stderr, "[nic-server] rdma send fail\n"); continue;
-        }
-        forwarded++;
-        if ((forwarded & 0xFFF) == 0) {
-            fprintf(stderr, "[nic-server] forwarded %" PRIu64 "\r", forwarded);
-        }
+        /* 2. No RDMA message — pump Comch recv briefly so the host can
+         *    complete its handshake and stay registered. */
+        size_t plen = msg_size;
+        (void)comch_nic_recv_blocking(cctx, buf, &plen, 50);
     }
     fprintf(stderr, "\n[nic-server] exiting (forwarded %" PRIu64 ")\n", forwarded);
 

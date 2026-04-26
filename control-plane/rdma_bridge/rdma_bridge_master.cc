@@ -31,6 +31,8 @@
 #include <chrono>
 #include <mutex>
 
+#include <vector>
+
 #include <getopt.h>
 #include <unistd.h>
 

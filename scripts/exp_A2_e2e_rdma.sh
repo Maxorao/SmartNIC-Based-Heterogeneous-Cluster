@@ -42,6 +42,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 cleanup
 
+# Startup order matters: fujian BF2 server blocks on RDMA accept until
+# tianjin BF2 client connects, so its Comch isn't up until then. Hosts can
+# only attach Comch after their local BF2 has started Comch.
+#
+# Order: fujian BF2 server -> tianjin BF2 client -> fujian ponger -> tianjin pinger
+
 # ---------------------------------------------------------------------------
 # Step 1: Start server-side NIC forwarder on fujian BF2
 # ---------------------------------------------------------------------------
@@ -52,27 +58,28 @@ ssh "${USER}@${FUJIAN_IP}" \
       --mode=server --bind-ip=${FUJIAN_SF_IP} --port=${PORT} \
       --dev-pci=${NIC_PCI} --service=${SERVICE} \
       > /tmp/e2e_nic_server.log 2>&1 &'"
-sleep 3
+sleep 2
 
 # ---------------------------------------------------------------------------
-# Step 2: Start ponger on fujian host (Comch endpoint, echoes back)
+# Step 2: Start NIC client forwarder on tianjin BF2 (triggers RDMA connect,
+#         which unblocks fujian BF2 to start its Comch listener)
 # ---------------------------------------------------------------------------
-echo "[step 2] Starting e2e_host ponger on fujian host..."
-ssh "${USER}@${FUJIAN_IP}" \
-    "nohup sudo ${EXP_BASE}/build/bench/rdma_e2e/e2e_host \
-      --mode=ponger --pci=${HOST_PCI} --service=${SERVICE} \
-      > /tmp/e2e_host_ponger.log 2>&1 &"
-sleep 3
-
-# ---------------------------------------------------------------------------
-# Step 3: Start NIC client forwarder on tianjin BF2
-# ---------------------------------------------------------------------------
-echo "[step 3] Starting e2e_nic client on tianjin BF2 (→${FUJIAN_SF_IP}:${PORT})..."
+echo "[step 2] Starting e2e_nic client on tianjin BF2 (→${FUJIAN_SF_IP}:${PORT})..."
 ssh "root@${BF_IP}" \
     "nohup /root/experiments/build/bench/rdma_e2e/e2e_nic \
       --mode=client --peer-ip=${FUJIAN_SF_IP} --port=${PORT} \
       --dev-pci=${NIC_PCI} --service=${SERVICE} \
       > /tmp/e2e_nic_client.log 2>&1 &"
+sleep 4
+
+# ---------------------------------------------------------------------------
+# Step 3: Start ponger on fujian host (Comch endpoint, echoes back)
+# ---------------------------------------------------------------------------
+echo "[step 3] Starting e2e_host ponger on fujian host..."
+ssh "${USER}@${FUJIAN_IP}" \
+    "nohup sudo ${EXP_BASE}/build/bench/rdma_e2e/e2e_host \
+      --mode=ponger --pci=${HOST_PCI} --service=${SERVICE} \
+      > /tmp/e2e_host_ponger.log 2>&1 &"
 sleep 3
 
 # ---------------------------------------------------------------------------

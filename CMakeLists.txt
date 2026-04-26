@@ -35,6 +35,23 @@ if(NOT gRPC_FOUND)
     find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
     set(GRPC_FOUND_VIA_PKGCONFIG TRUE)
 
+    # When using pkg-config gRPC (e.g. DOCA's /opt/mellanox/grpc), the bundled
+    # protoc may be newer than the system libprotobuf. Use the protobuf library
+    # from the same prefix as grpc++ to avoid version mismatch link errors.
+    pkg_get_variable(GRPC_PREFIX grpc++ prefix)
+    if(GRPC_PREFIX)
+        find_library(GRPC_PROTOBUF_LIB protobuf PATHS "${GRPC_PREFIX}/lib" NO_DEFAULT_PATH)
+        if(GRPC_PROTOBUF_LIB)
+            message(STATUS "Using protobuf from gRPC prefix: ${GRPC_PROTOBUF_LIB}")
+            set(Protobuf_LIBRARIES "${GRPC_PROTOBUF_LIB}" CACHE FILEPATH "" FORCE)
+            # Also override the imported target
+            if(TARGET protobuf::libprotobuf)
+                set_target_properties(protobuf::libprotobuf PROPERTIES
+                    IMPORTED_LOCATION "${GRPC_PROTOBUF_LIB}")
+            endif()
+        endif()
+    endif()
+
     if(NOT TARGET gRPC::grpc++)
         add_library(gRPC::grpc++ INTERFACE IMPORTED)
         set_target_properties(gRPC::grpc++ PROPERTIES

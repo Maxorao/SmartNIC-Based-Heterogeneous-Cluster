@@ -29,6 +29,8 @@
 #include <thread>
 #include <chrono>
 
+#include <vector>
+
 #include <getopt.h>
 #include <unistd.h>
 #include <sys/socket.h>
