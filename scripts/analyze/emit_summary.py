@@ -155,10 +155,24 @@ def summarize_B(data_dir: str) -> dict:
     }
 
 
+def _first_existing(*paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return paths[0]
+
+
 def summarize_H(data_dir: str) -> dict:
-    g1 = parse_gflops_from_text(os.path.join(data_dir, "h1_gemm_alone.txt"))
-    g2 = parse_gflops_from_text(os.path.join(data_dir, "h2_gemm_colocated.txt"))
-    g3 = parse_gflops_from_text(os.path.join(data_dir, "h3_gemm_offloaded.txt"))
+    # Accept both legacy filenames and v2 (h{N}_gemm.txt).
+    g1 = parse_gflops_from_text(_first_existing(
+        os.path.join(data_dir, "h1_gemm.txt"),
+        os.path.join(data_dir, "h1_gemm_alone.txt")))
+    g2 = parse_gflops_from_text(_first_existing(
+        os.path.join(data_dir, "h2_gemm.txt"),
+        os.path.join(data_dir, "h2_gemm_colocated.txt")))
+    g3 = parse_gflops_from_text(_first_existing(
+        os.path.join(data_dir, "h3_gemm.txt"),
+        os.path.join(data_dir, "h3_gemm_offloaded.txt")))
     rps2 = parse_wrk_reqs(os.path.join(data_dir, "h2_wrk.txt"))
     rps3 = parse_wrk_reqs(os.path.join(data_dir, "h3_wrk.txt"))
     llc1 = parse_perf_llc(os.path.join(data_dir, "h1_perf.txt"))
