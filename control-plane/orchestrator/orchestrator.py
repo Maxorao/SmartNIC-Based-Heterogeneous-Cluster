@@ -172,7 +172,7 @@ def run_cmd(cmd: str, ssh_target: Optional[str] = None,
 def measure_llc_miss_rate(ssh_target: Optional[str],
                           duration: float = 2.0) -> Optional[float]:
     """Measure system-wide LLC miss rate. Returns ratio or None."""
-    perf_cmd = f"perf stat -e LLC-load-misses,LLC-loads -a sleep {duration} 2>&1"
+    perf_cmd = f"sudo perf stat -e LLC-load-misses,LLC-loads -C 48-63 sleep {duration} 2>&1"
     rc, out, err = run_cmd(perf_cmd, ssh_target, timeout=int(duration) + 10)
     combined = out + "\n" + err
 
@@ -492,9 +492,19 @@ class Orchestrator:
     # --- Phase 0: Calibration ---
 
     def calibrate_baseline(self):
-        """Measure baseline LLC miss rate on each node (no workload interference)."""
+        """Measure baseline LLC miss rate on each node (no workload interference).
+
+        If a baseline was already set via --llc-baseline (i.e. non-zero and different
+        from the default 0.18), skip re-calibration to preserve the externally
+        supplied clean-system baseline.
+        """
         self.log.info("Calibrating per-node LLC baselines...")
         for uid, node in self.cfg.nodes.items():
+            # Honour externally supplied baseline
+            if uid in self.node_baselines and self.node_baselines[uid] > 0 and \
+               abs(self.node_baselines[uid] - 0.18) > 0.001:
+                self.log.info(f"  {uid}: using supplied baseline={self.node_baselines[uid]:.4f}")
+                continue
             rate = measure_llc_miss_rate(node.host_ssh, self.cfg.perf_duration)
             if rate is not None:
                 self.node_baselines[uid] = rate
